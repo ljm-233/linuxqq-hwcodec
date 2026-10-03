@@ -365,3 +365,53 @@ grep -aE 'ASYNCCB|出帧|回调' /run/user/1000/linuxqq-wayland-fix.log | tail -
 ```bash
 grep -aE '原实现回调|-> data=' /run/user/1000/linuxqq-wayland-fix.log | tail -8
 ```
+
+---
+
+## 码流封装 / 参数对照实验（`QQ_NVENC_HEXDUMP` / `QQ_NVENC_BASELINE`）
+
+同步版与异步回调版**对端都转圈** ✗，几何与 packet 偏移都已排除 → 剩下的最强嫌疑是**码流封装或编码参数和接收端不一致**（接收端拿到 NVENC 的 H.264 却解不出来）。
+那两个开关是**只打印/改参数**的，不用换 `.so`，可以 A/B。
+
+### A. 先看两条路径的码流首部（`QQ_NVENC_HEXDUMP=1`）
+
+```bash
+# 完全退出 QQ
+QQ_WAYLAND_FIX_ANGLE=off LD_PRELOAD=$HOME/coding/linuxqq-hwcodec/libqq-nvenc.so \
+QQ_NVENC=1 QQ_NVENC_ACTIVE=1 QQ_NVENC_HEXDUMP=1 linuxqq-wayland-fix
+
+# 开共享、动着屏幕，然后：
+grep -aE '\[原实现\]|\[NVENC\]' /run/user/1000/linuxqq-wayland-fix.log | tail -12
+```
+
+每个码流会打两行：`码流 len=… 首 16 字节: …` 和 `封装=… SPS=… PPS=… IDR=… profile=…`。
+**原实现那条是在回调里【立刻】取的**（它复用同一块缓冲，延后读就没意义 ✗），NVENC 那条是在 `UnlockBitstream` **之前**取的 ✓。
+
+| 看到 | 含义 | 下一步 |
+|---|---|---|
+| 两者都 `Annex-B`、都有 `SPS=有 PPS=有` | 封装一致 ✗ 不是病因 | 看 profile 是否不同 → 试 B |
+| 原实现 `Annex-B`，NVENC `AVCC(4字节长度前缀)` | **封装不一致** ✓✓ 接收端按 Annex-B 解就会失败 | 这是 PR 需要修的（或本变体需要改封装） |
+| NVENC 那条 `SPS=无` / `PPS=无` | 每帧没带参数集 → 接收端等不到关键帧信息 | 检查 `repeatSPSPPS` / `NV_ENC_PIC_FLAG_OUTPUT_SPSPPS` |
+| `profile=` 不一致（如原实现 `0x42 Baseline`、NVENC `0x64 High`） | **档位不一致** ✓ 接收/转发链路可能只吃基线档 | 试 B |
+
+### B. 强制 Baseline 档（`QQ_NVENC_BASELINE=1`）
+
+```bash
+# 完全退出 QQ
+QQ_WAYLAND_FIX_ANGLE=off LD_PRELOAD=$HOME/coding/linuxqq-hwcodec/libqq-nvenc.so \
+QQ_NVENC=1 QQ_NVENC_ACTIVE=1 QQ_NVENC_BASELINE=1 linuxqq-wayland-fix
+```
+
+生效时日志会写：`NVENC: 会话就绪 … , profile=Baseline(强制)`。它同时把熵编码切成 **CAVLC**（Baseline 不允许 CABAC）、**清空 VUI**、**去掉 AUD**。
+
+**成功判据（A、B 都是这一条）：对端出现画面。** 还是转圈就按第三节"失败该留哪些证据"收集日志留给作者。
+
+### 三组对照
+
+| 组 | 命令里的开关 | 期望 |
+|---|---|---|
+| A 同步（现状） | `QQ_NVENC=1 QQ_NVENC_ACTIVE=1` | 对端转圈（已知 ✗） |
+| B 异步回调 | `… QQ_NVENC_ASYNCCB=1` | 已试，仍转圈 ✗ |
+| C 关掉 NVENC（可用态） | 只留 `QQ_NVENC=1` | 画面正常 ✓（对照组） |
+
+（本轮新增：`QQ_NVENC_HEXDUMP`、`QQ_NVENC_BASELINE`；本地累计改动见 `patches/pr28-local-experiments.patch`，包含异步回调 + 这两个开关。）
