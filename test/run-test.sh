@@ -35,7 +35,7 @@ expect_output() {
 echo
 echo "=== A. 开启模式（HWPROBE_VTABLE=1）"
 logA=$(mktemp /tmp/hwprobe-A-XXXX.log)
-outA=$(LD_PRELOAD=../libhwprobe.so HWPROBE_VTABLE=1 HWPROBE_LOG="$logA" ./driver 2>&1)
+outA=$(LD_PRELOAD=../libhwprobe.so HWPROBE_ALL=1 HWPROBE_VTABLE=1 HWPROBE_LOG="$logA" ./driver 2>&1)
 rcA=$?
 expect_output "$outA" "$rcA"
 grep -q "已代理 IClassFactory" "$logA"                  ; chk $? "代理了 IClassFactory"
@@ -46,7 +46,7 @@ grep -qE "vtable\[[0-9]+\]  调用 [0-9]+ 次" "$logA"      ; chk $? "汇总里�
 echo
 echo "=== B. 默认模式（不设 HWPROBE_VTABLE，应当完全不动宿主）"
 logB=$(mktemp /tmp/hwprobe-B-XXXX.log)
-outB=$(LD_PRELOAD=../libhwprobe.so HWPROBE_LOG="$logB" ./driver 2>&1)
+outB=$(LD_PRELOAD=../libhwprobe.so HWPROBE_ALL=1 HWPROBE_LOG="$logB" ./driver 2>&1)
 rcB=$?
 expect_output "$outB" "$rcB"
 if grep -q "已代理 IClassFactory" "$logB"; then echo "  ✗ 默认模式不该代理工厂"; fail=1; else echo "  ✓ 默认模式不代理工厂"; fi
@@ -55,7 +55,7 @@ grep -q "COM 虚表观测：未启用" "$logB"                   ; chk $? "日�
 echo
 echo "=== C. 日志上限（HWPROBE_VTABLE_MAXLOG=3）"
 logC=$(mktemp /tmp/hwprobe-C-XXXX.log)
-outC=$(LD_PRELOAD=../libhwprobe.so HWPROBE_VTABLE=1 HWPROBE_VTABLE_MAXLOG=3 HWPROBE_LOG="$logC" ./driver 2>&1)
+outC=$(LD_PRELOAD=../libhwprobe.so HWPROBE_ALL=1 HWPROBE_VTABLE=1 HWPROBE_VTABLE_MAXLOG=3 HWPROBE_LOG="$logC" ./driver 2>&1)
 rcC=$?
 expect_output "$outC" "$rcC"
 n=$(grep -cE "vtable\[[0-9]+\] (call|ret )" "$logC")

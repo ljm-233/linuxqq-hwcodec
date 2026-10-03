@@ -11,9 +11,15 @@ so="$here/libhwprobe.so"
 [ -f "$so" ] || { echo "还没编译，先跑：$here/build.sh" >&2; exit 1; }
 command -v linuxqq-wayland-fix >/dev/null || { echo "找不到 linuxqq-wayland-fix（先装 linuxqq-wayland-fix）" >&2; exit 1; }
 
+# 辅助命令（date/pgrep/grep/head/pw-dump/seq/sleep）一律摘掉 LD_PRELOAD 再跑。
+# 2026-10-03 实测：不摘的话每条辅助命令都会继承探针、各自在日志里写一份汇总块 ——
+# 一份 3768 行 / 232 个进程块的日志，翻半天有效数据为零。
+# LD_PRELOAD= （空值）时动态加载器不会预加载任何库，比再 fork 一个 env 更干净。
+nopre() { LD_PRELOAD= HWPROBE_LOG= HWPROBE_VTABLE= HWPROBE_ALL= "$@"; }
+
 logdir="${XDG_CACHE_HOME:-$HOME/.cache}/linuxqq-hwcodec"
 mkdir -p "$logdir"
-log="$logdir/probe-$(date +%Y%m%d-%H%M%S).log"
+log="$logdir/probe-$(nopre date +%Y%m%d-%H%M%S).log"
 
 export HWPROBE_LOG="$log"
 # 画面正常靠它（2026-10-03 实测：--use-angle=vulkan 会让接收画面缩成小图）
@@ -22,64 +28,84 @@ export QQ_WAYLAND_FIX_ANGLE="${QQ_WAYLAND_FIX_ANGLE:-off}"
 export LD_PRELOAD="$so${LD_PRELOAD:+:$LD_PRELOAD}"
 
 {
-	echo "=== 探针启动 $(date '+%F %T')"
+	echo "=== 探针启动 $(nopre date '+%F %T')"
 	echo "    探针库: $so"
 	echo "    QQ_WAYLAND_FIX_ANGLE=$QQ_WAYLAND_FIX_ANGLE"
 	echo "    LD_PRELOAD=$LD_PRELOAD"
 	echo "    HWPROBE_VTABLE=${HWPROBE_VTABLE:-（未设，COM 层不挂钩）}"
 } >>"$log"
 
-printf '日志: %s\n照着用：开一次屏幕共享（30 秒左右），结束后把日志发回来。\n' "$log" >&2
+append_log() {   # 每行都带时间戳写进日志
+	local ts l
+	ts=$(nopre date '+%F %T')
+	for l in "$@"; do printf '%s %s\n' "$ts" "$l" >>"$HWPROBE_LOG" 2>/dev/null; done
+}
 
-if [ -n "${HWPROBE_VTABLE:-}" ] && [ "${HWPROBE_VTABLE}" != 0 ]; then
-
-	printf 'COM 虚表观测：已启用（每次接口方法调用都会记一行 vtable[槽位]）\n' >&2
-
-else
-
-	printf 'COM 虚表观测：未启用（要看编码器选择点就加 HWPROBE_VTABLE=1 重启 QQ）\n' >&2
-
-fi
 # ---------------------------------------------------------------------------
-# 自检：确认探针到底进了哪个进程、以及共享有没有真的跑起来
+# 自检：确认探针到底进了哪个进程、共享有没有真的跑起来
 #   （2026-10-03 的教训：日志里几十个进程块，没有自检就分不清收帧进程有没有被覆盖）
-selfcheck_once() {
-	local p pp fix bc share line verdict
-	p=$(pgrep -f 'type=ppapi' 2>/dev/null | head -1)
+# 输出两行：状态行 + 结论行（结论行以「自检结论：」开头，便于 grep 与机器判读）
+selfcheck_lines() {
+	local p pp fix bc share
+
+	p=$(nopre pgrep -f 'type=ppapi' 2>/dev/null | nopre head -1)
 	if [ -z "$p" ]; then
-		printf '自检：还没找到 --type=ppapi 收帧进程（QQ 未启动或还没开过共享）\n'
+		printf '自检：没有 --type=ppapi 收帧进程（QQ 未启动，或者还没开过共享）\n'
+		printf '自检结论：失败 —— 没有收帧进程。请先完全退出 QQ（含托盘，pgrep -x qq 应为空），再用本启动器启动，然后开一次共享。\n'
 		return 1
 	fi
+
 	pp=不在; fix=不在; bc=不在
-	grep -qs 'libhwprobe\.so' "/proc/$p/maps" && pp=在
-	grep -qs 'libqq-wl-portal\.so' "/proc/$p/maps" && fix=在
-	grep -qs 'broadcast-core\.so' "/proc/$p/maps" && bc=在
+	nopre grep -qs 'libhwprobe\.so' "/proc/$p/maps" && pp=在
+	nopre grep -qs 'libqq-wl-portal\.so' "/proc/$p/maps" && fix=在
+	nopre grep -qs 'broadcast-core\.so' "/proc/$p/maps" && bc=在
 	share=未开始
-	pw-dump 2>/dev/null | grep -q 'Stream/Output/Video' && share=进行中
-	line="自检：收帧进程 ppapi(pid=$p) 探针=$pp 修复库=$fix broadcast-core=$bc 共享=$share"
-	printf '%s\n' "$line"
+	nopre pw-dump 2>/dev/null | nopre grep -q 'Stream/Output/Video' && share=进行中
+
+	printf '自检：收帧进程 ppapi(pid=%s) 探针=%s 修复库=%s broadcast-core=%s 共享=%s\n' \
+		"$p" "$pp" "$fix" "$bc" "$share"
+
 	if [ "$pp" = 不在 ]; then
-		verdict="自检结论：探针没有进入收帧进程 —— 这次日志看不到编码器选择（请务必用本脚本启动 QQ）"
-	elif [ "$bc" = 不在 ] && [ "$share" = 进行中 ]; then
-		verdict="自检结论：正在共享但 broadcast-core 未加载 —— 编码还没开始，稍等再看"
-	elif [ "$bc" = 在 ]; then
-		verdict="自检结论：探针已随 broadcast-core 在收帧进程里 —— 这份日志有用，可以回传"
-	else
-		verdict="自检结论：探针在收帧进程里，但共享还没开始（开一次共享再看）"
+		printf '自检结论：失败 —— 探针不在收帧进程（它属于另一个 QQ 实例？先完全退出 QQ 再启动）\n'
+		return 1
 	fi
-	printf '%s\n' "$verdict"
+	if [ "$fix" = 不在 ]; then
+		printf '自检结论：失败 —— 修复库不在收帧进程里（这样共享会失败；确认走的是 linuxqq-wayland-fix）\n'
+		return 1
+	fi
+	if [ "$bc" = 不在 ]; then
+		if [ "$share" = 进行中 ]; then
+			printf '自检结论：等待 —— 正在共享，但 broadcast-core 还没加载（编码还没开始，几秒后再跑一次）\n'
+		else
+			printf '自检结论：等待 —— 探针已就位，但共享还没开始（开一次共享后再跑 --selfcheck-once）\n'
+		fi
+		return 1
+	fi
+	if [ "$share" != 进行中 ]; then
+		printf '自检结论：等待 —— 探针与 broadcast-core 都在，但共享未开始（开一次共享后再跑 --selfcheck-once）\n'
+		return 1
+	fi
+	printf '自检结论：可以采集 —— 探针=在 修复库=在 broadcast-core=在 共享=进行中\n'
 	return 0
 }
 
-watch_ppapi() {   # 后台跑：状态变化才写一行，最长 10 分钟
+selfcheck_once() {   # 打印到终端 + 写进日志（这样结论不会只活在 stdout 里）
+	local out rc
+	out=$(selfcheck_lines); rc=$?
+	printf '%s\n' "$out"
+	printf '%s\n' "$out" | while IFS= read -r l; do append_log "$l"; done
+	return $rc
+}
+
+watch_ppapi() {   # 后台跑：结论变化才写一行，最长 10 分钟
 	local i prev="" now
-	for i in $(seq 1 120); do
-		now=$(selfcheck_once 2>/dev/null | head -1)
+	for i in $(nopre seq 1 120); do
+		now=$(selfcheck_lines 2>/dev/null | nopre tail -1)
 		if [ -n "$now" ] && [ "$now" != "$prev" ]; then
-			printf '%s %s\n' "$(date '+%F %T')" "$now" >>"$HWPROBE_LOG" 2>/dev/null
+			append_log "$now"
 			prev="$now"
 		fi
-		sleep 5
+		nopre sleep 5
 	done
 }
 
@@ -88,8 +114,16 @@ case "${1:-}" in
 	--selfcheck)      echo "监控中，日志: $HWPROBE_LOG"; watch_ppapi; exit 0 ;;
 esac
 
-# 启动前先跑一次，并把结果写进日志；之后每 5 秒复查一次（只读 /proc 与 pw-dump，不碰任何进程）
-selfcheck_once >>"$HWPROBE_LOG" 2>/dev/null || true
+if [ -n "${HWPROBE_VTABLE:-}" ] && [ "${HWPROBE_VTABLE}" != 0 ]; then
+	printf 'COM 虚表观测：已启用（每次接口方法调用都会记一行 vtable[槽位]）\n' >&2
+else
+	printf 'COM 虚表观测：未启用（要看编码器选择点就加 HWPROBE_VTABLE=1 重启 QQ）\n' >&2
+fi
+
+printf '日志: %s\n照着用：开一次屏幕共享（30 秒左右），结束后把日志发回来。\n' "$log" >&2
+
+# 启动前先跑一次并把结论写进日志；之后每 5 秒复查（只读 /proc 与 pw-dump，不碰任何进程）
+selfcheck_once >/dev/null
 watch_ppapi &
 printf '自检已启动：若收帧进程里没有探针，日志里会明确写出来（不用猜）\n' >&2
 

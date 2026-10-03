@@ -21,14 +21,18 @@
 
 ## 用法
 
+**顺序错了日志就白跑**（2026-10-03 实测过一份 3768 行全是噪音的日志）：
+
 ```bash
-./build.sh                                  # 1. 编译出 libhwprobe.so
+./build.sh                                   # 1. 编译出 libhwprobe.so
 
-./linuxqq-hwcodec-probe                     # 2a. Phase 1：只看后端（不碰 COM）
-HWPROBE_VTABLE=1 ./linuxqq-hwcodec-probe    # 2b. Phase 2：连带观测 COM 方法调用
+pgrep -x qq                                  # 2. 必须没有任何输出：先完全退出 QQ（含托盘）
 
-#    两种都用它启动 QQ，然后开一次屏幕共享跑 30 秒，最后从托盘正常退出 QQ
-cat ~/.cache/linuxqq-hwcodec/probe-*.log    # 3. 看日志（发回即可）
+HWPROBE_VTABLE=1 ./linuxqq-hwcodec-probe     # 3. 用它启动 QQ（只看后端就不加 HWPROBE_VTABLE=1）
+#    开一次屏幕共享，跑 30 秒左右
+
+./linuxqq-hwcodec-probe --selfcheck-once     # 4. ★ 必须先看到「自检结论：可以采集」
+cat ~/.cache/linuxqq-hwcodec/probe-*.log     # 5. 再回传日志
 ```
 
 探针是 `LD_PRELOAD` 库，**不改 QQ 任何文件**；恢复原状照常从原图标启动即可。
@@ -83,15 +87,31 @@ $ test/run-test.sh
 - [wayland-cast-doctor](https://github.com/ljm-233/wayland-cast-doctor)：排查共享不出画面的诊断脚本
 - [linuxqq-wayland-fix](https://github.com/SHORiN-KiWATA/linuxqq-wayland-fix)：QQ 客户端侧注入修复（本项目的 hook 写法参考它）
 
-## 先确认探针进了哪个进程（每次跑完先看这两行）
+## 日志里只该有 QQ 进程
 
-日志里有几十个进程块，**先找自检结论**：
+`LD_PRELOAD` 会被**每一条子命令**继承 —— 启动器自己跑的 `date`/`pgrep`/`grep`/`head`/`pw-dump` 也不例外，
+它们会各自在日志里写一份十几行的汇总块。2026-10-03 用户交回来的一份日志就是这样：
+**3768 行 / 232 个进程块，几乎全是噪音，有效数据为零**。两个地方都堵上了：
 
-    自检：收帧进程 ppapi(pid=…) 探针=在 修复库=在 broadcast-core=在 共享=进行中
-    自检结论：探针已随 broadcast-core 在收帧进程里 —— 这份日志有用，可以回传
+- 启动器里所有辅助命令都摘掉 `LD_PRELOAD` 再跑（`nopre()`；实测这些命令现在在日志里占 0 行）
+- 探针只对 **cmdline 命中 `qq`/`ppapi`** 的进程输出汇总块，其它进程只留一行
+  `hwprobe 已注入 pid=… cmdline=…（非 QQ 进程，只记这一行）`；要看全部进程就设 `HWPROBE_ALL=1`
+  （自检脚本用的就是它）
 
-- `探针=不在` → 这次日志看不到编码器选择，**必须用本脚本启动 QQ**（用平时的方式启动，探针不会在里面）
-- `broadcast-core=不在` 且 `共享=进行中` → 编码还没真正开始，等几秒再看
-- 每个进程块现在都带 `命令行：…` 和 `父进程：N`，不用再猜哪块是哪个进程
+所以日志里看到 `命令行：date`、`命令行：pgrep` 这类块，说明跑的不是现在这版启动器。
 
-不想启动 QQ 只想看现状：`./linuxqq-hwcodec-probe --selfcheck-once`
+## 先看自检结论，再决定这份日志值不值得看
+
+`--selfcheck-once` 会把状态行与结论行**同时打印并写进日志**（结论行以 `自检结论：` 开头）。只有这一种
+情况日志里的 `vtable[N]` 才是真数据：
+
+| `自检结论：` | 含义 |
+|---|---|
+| `可以采集 —— 探针=在 修复库=在 broadcast-core=在 共享=进行中` | **唯一有效**，可以回传 |
+| `失败 —— 没有收帧进程。请先完全退出 QQ（含托盘，pgrep -x qq 应为空），再用本启动器启动，然后开一次共享。` | QQ 没开或没共享就跑了探针 → 按顺序重来 |
+| `失败 —— 探针不在收帧进程（它属于另一个 QQ 实例？先完全退出 QQ 再启动）` | 旧实例还活着，探针进不去 → 完全退出后重来 |
+| `失败 —— 修复库不在收帧进程里（这样共享会失败；确认走的是 linuxqq-wayland-fix）` | 启动器链路不对 |
+| `等待 —— 探针已就位，但共享还没开始` / `等待 —— 正在共享，但 broadcast-core 还没加载` | 开共享 / 等几秒再跑一次 |
+
+每个进程块都带 `命令行：…` 与 `父进程：N`，不用再猜哪块是哪个进程。不想启动 QQ、只想看现状：
+`./linuxqq-hwcodec-probe --selfcheck-once`（失败时退出码非 0）。

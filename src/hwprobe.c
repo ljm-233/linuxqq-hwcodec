@@ -400,10 +400,17 @@ static void on_sig(int sig)
     _exit(0);
 }
 
+/* 只有 cmdline 里带 qq / ppapi 的进程才值得输出那一整套汇总块 */
+static int cmdline_relevant(const char *cbuf)
+{
+    return cbuf && (strstr(cbuf, "qq") || strstr(cbuf, "QQ") || strstr(cbuf, "ppapi"));
+}
+
 __attribute__((constructor)) static void hwprobe_init(void)
 {
     const char *path = getenv("HWPROBE_LOG");
     const char *p;
+    char cbuf[512];
 
     log_all = getenv("HWPROBE_ALL") != NULL;
     if (path && *path) {
@@ -416,14 +423,12 @@ __attribute__((constructor)) static void hwprobe_init(void)
     real_dlerror = hwprobe_lookup_real("dlerror");
     real_dlmopen = hwprobe_lookup_real("dlmopen");
 
-    vthook_init();
-    hwprobe_plog("=== hwprobe 已注入 pid=%d ===", (int)getpid());
     /*
      * 同一份日志里有几十个进程，只记 pid 分不清哪个块是哪个进程
      * （2026-10-03：Phase 2 的日志因此无法判断收帧进程有没有被覆盖）。
      */
+    cbuf[0] = '\0';
     {
-        char cbuf[512];
         int cfd = open("/proc/self/cmdline", O_RDONLY);
         ssize_t cn = cfd >= 0 ? read(cfd, cbuf, sizeof(cbuf) - 1) : -1;
         ssize_t ci;
@@ -433,10 +438,25 @@ __attribute__((constructor)) static void hwprobe_init(void)
             for (ci = 0; ci < cn - 1; ci++)
                 if (cbuf[ci] == '\0') cbuf[ci] = ' ';
             if (cn > 260) cbuf[260] = '\0';
-            hwprobe_plog("命令行：%s", cbuf);
         }
-        hwprobe_plog("父进程：%d", (int)getppid());
     }
+
+    /*
+     * 非 QQ 进程（date / pgrep / grep / head 这些辅助命令也会继承 LD_PRELOAD）
+     * 只留一行说明就退出：2026-10-03 实测，不加这个闸门时这些辅助命令各自写一份
+     * 十几行的汇总块，一份日志被灌到 3768 行 / 232 个进程块，有效数据为零。
+     */
+    if (!log_all && !cmdline_relevant(cbuf)) {
+        hwprobe_plog("hwprobe 已注入 pid=%d cmdline=%s（非 QQ 进程，只记这一行）",
+                     (int)getpid(), cbuf[0] ? cbuf : "?");
+        return;
+    }
+
+    vthook_init();
+    hwprobe_plog("=== hwprobe 已注入 pid=%d ===", (int)getpid());
+    if (cbuf[0])
+        hwprobe_plog("命令行：%s", cbuf);
+    hwprobe_plog("父进程：%d", (int)getppid());
     p = getenv("QQ_WAYLAND_FIX_ANGLE");
     hwprobe_plog("环境：QQ_WAYLAND_FIX_ANGLE=%s", p ? p : "(未设)");
     p = getenv("LD_PRELOAD");
