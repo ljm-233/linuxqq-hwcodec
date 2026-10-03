@@ -26,7 +26,18 @@ export LD_PRELOAD="$so${LD_PRELOAD:+:$LD_PRELOAD}"
 	echo "    探针库: $so"
 	echo "    QQ_WAYLAND_FIX_ANGLE=$QQ_WAYLAND_FIX_ANGLE"
 	echo "    LD_PRELOAD=$LD_PRELOAD"
+	echo "    HWPROBE_VTABLE=${HWPROBE_VTABLE:-（未设，COM 层不挂钩）}"
 } >>"$log"
 
 printf '日志: %s\n照着用：开一次屏幕共享（30 秒左右），结束后把日志发回来。\n' "$log" >&2
+
+if [ -n "${HWPROBE_VTABLE:-}" ] && [ "${HWPROBE_VTABLE}" != 0 ]; then
+
+	printf 'COM 虚表观测：已启用（每次接口方法调用都会记一行 vtable[槽位]）\n' >&2
+
+else
+
+	printf 'COM 虚表观测：未启用（要看编码器选择点就加 HWPROBE_VTABLE=1 重启 QQ）\n' >&2
+
+fi
 exec linuxqq-wayland-fix "$@"

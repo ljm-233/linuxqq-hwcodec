@@ -1,3 +1,5 @@
 *.so
 *.o
 probe-*.log
+test/driver
+test/libfakecom.so

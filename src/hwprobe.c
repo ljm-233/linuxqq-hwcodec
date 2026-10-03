@@ -28,6 +28,8 @@
 #include <time.h>
 #include <stdint.h>
 
+#include "hwprobe.h"
+
 static int logfd = 2;                 /* 默认 stderr；HWPROBE_LOG 可改 */
 static int log_all = 0;               /* HWPROBE_ALL=1 时记录所有 dlsym */
 static int in_boot = 0;               /* dlvsym 引导期间的重入保护 */
@@ -40,9 +42,27 @@ static void *(*real_dlmopen)(long, const char *, int);
 static void *(*real_dlsym)(void *, const char *);
 static char *(*real_dlerror)(void);
 
+/* 给 vthook.c 的访问器（日志 fd 与"未被包装"的真实函数） */
+int hwprobe_logfd(void)
+{
+    return logfd;
+}
+
+void *hwprobe_real_dlopen(const char *file, int flags)
+{
+    return real_dlopen ? real_dlopen(file, flags) : NULL;
+}
+
+void *hwprobe_real_dlsym(void *handle, const char *name)
+{
+    return real_dlsym ? real_dlsym(handle, name) : NULL;
+}
+
+static void *cls_handle;   /* dlsym 请求 DllGetClassObject 时用的那个 handle */
+
 /* ---------- 工具 ---------- */
 
-static void plog(const char *fmt, ...)
+void hwprobe_plog(const char *fmt, ...)
 {
     char buf[600];
     int n;
@@ -64,9 +84,15 @@ static void plog(const char *fmt, ...)
 }
 
 /* 用没有被包装的 dlvsym 取真实函数，避免递归进我们自己的 dlsym */
-static void *lookup_real(const char *name)
+void *hwprobe_lookup_real(const char *name)
 {
-    static const char *vers[] = { "GLIBC_2.2.5", "GLIBC_2.34", "GLIBC_2.17", NULL };
+    /*
+     * 版本列表必须够全：dlmopen 的标签是 GLIBC_2.3.4，之前不在列表里 —— 于是真实
+     * dlmopen 取不到、我们的包装对每次调用都返回 NULL，把用 dlmopen 隔离命名空间的
+     * 程序（实测：eglinfo 的 EGL 探测整段失败）直接搞坏。最后再用"不指定版本"兜底。
+     */
+    static const char *vers[] = { "GLIBC_2.2.5", "GLIBC_2.34", "GLIBC_2.17", "GLIBC_2.3.4",
+                                  "GLIBC_2.35", NULL };
     void *p = NULL;
     int i;
 
@@ -76,7 +102,9 @@ static void *lookup_real(const char *name)
     for (i = 0; vers[i] && !p; i++)
         p = dlvsym(RTLD_NEXT, name, vers[i]);
     if (!p)
-        p = dlvsym(RTLD_DEFAULT, name, "GLIBC_2.2.5");
+        p = dlvsym(RTLD_NEXT, name, NULL); /* version=NULL 等价于 dlsym：最后的兜底 */
+    if (!p)
+        p = dlvsym(RTLD_DEFAULT, name, NULL);
     in_boot = 0;
     return p;
 }
@@ -178,11 +206,11 @@ void *dlopen(const char *file, int flags)
     int wanted;
 
     if (!real_dlopen)
-        real_dlopen = lookup_real("dlopen");
+        real_dlopen = hwprobe_lookup_real("dlopen");
     if (!real_dlerror)
-        real_dlerror = lookup_real("dlerror");
+        real_dlerror = hwprobe_lookup_real("dlerror");
     if (!real_dlsym)
-        real_dlsym = lookup_real("dlsym");
+        real_dlsym = hwprobe_lookup_real("dlsym");
 
     wanted = interesting_lib(file);
     n_dlopen++;
@@ -197,9 +225,9 @@ void *dlopen(const char *file, int flags)
     }
     note_lib(file, h != NULL);
     if (wanted)
-        plog("dlopen(\"%s\", 0x%x) -> %s%s", base(file), flags, h ? "成功" : "失败", err);
+        hwprobe_plog("dlopen(\"%s\", 0x%x) -> %s%s", base(file), flags, h ? "成功" : "失败", err);
     else if (log_all)
-        plog("dlopen(\"%s\", 0x%x) -> %s%s", base(file), flags, h ? "成功" : "失败", err);
+        hwprobe_plog("dlopen(\"%s\", 0x%x) -> %s%s", base(file), flags, h ? "成功" : "失败", err);
     return h;
 }
 
@@ -208,13 +236,13 @@ void *dlmopen(long nsid, const char *file, int flags)
     void *h;
 
     if (!real_dlmopen)
-        real_dlmopen = lookup_real("dlmopen");
+        real_dlmopen = hwprobe_lookup_real("dlmopen");
     if (!real_dlmopen)
         return NULL;
     h = real_dlmopen(nsid, file, flags);
     note_lib(file, h != NULL);
     if (interesting_lib(file) || log_all)
-        plog("dlmopen(%ld, \"%s\", 0x%x) -> %s", nsid, base(file), flags, h ? "成功" : "失败");
+        hwprobe_plog("dlmopen(%ld, \"%s\", 0x%x) -> %s", nsid, base(file), flags, h ? "成功" : "失败");
     return h;
 }
 
@@ -223,11 +251,13 @@ void *dlsym(void *handle, const char *name)
     void *r;
 
     if (!real_dlsym)
-        real_dlsym = lookup_real("dlsym");
+        real_dlsym = hwprobe_lookup_real("dlsym");
     n_dlsym++;
 
-    if (name && strcmp(name, "DllGetClassObject") == 0)
+    if (name && strcmp(name, "DllGetClassObject") == 0) {
+        cls_handle = handle;   /* 真实实现未必在 broadcast-core 里（测试用的假 COM 库也是这条路） */
         r = (void *)my_DllGetClassObject;
+    }
     else if (name && strcmp(name, "NvEncodeAPICreateInstance") == 0)
         r = (void *)my_NvEncodeAPICreateInstance;
     else if (name && strcmp(name, "NvEncodeAPIGetMaxSupportedVersion") == 0)
@@ -236,7 +266,7 @@ void *dlsym(void *handle, const char *name)
         r = real_dlsym ? real_dlsym(handle, name) : NULL;
 
     if (interesting_sym(name))
-        plog("dlsym(%p, \"%s\") -> %p%s", handle, name ? name : "(null)", r,
+        hwprobe_plog("dlsym(%p, \"%s\") -> %p%s", handle, name ? name : "(null)", r,
              r ? "" : " [没找到]");
     return r;
 }
@@ -258,16 +288,20 @@ static void *my_DllGetClassObject(const void *clsid, const void *iid, void **out
     void *r;
     char cs[64] = "?", is[64] = "?";
 
-    /* 真实的 DllGetClassObject 从已经加载的 broadcast-core.so 里取 */
+    /* 真实实现：优先用 dlsym 时记录的那个 handle，取不到再退回 broadcast-core.so */
     {
         static void *bc;
         static int tried;
-        if (!tried) {
-            tried = 1;
-            if (real_dlopen)
-                bc = real_dlopen("broadcast-core.so", RTLD_NOW | RTLD_NOLOAD);
+
+        fn = (cls_handle && real_dlsym) ? real_dlsym(cls_handle, "DllGetClassObject") : NULL;
+        if (!fn) {
+            if (!tried) {
+                tried = 1;
+                if (real_dlopen)
+                    bc = real_dlopen("broadcast-core.so", RTLD_NOW | RTLD_NOLOAD);
+            }
+            fn = (bc && real_dlsym) ? real_dlsym(bc, "DllGetClassObject") : NULL;
         }
-        fn = (bc && real_dlsym) ? real_dlsym(bc, "DllGetClassObject") : NULL;
     }
     n_cls++;
     if (clsid)
@@ -275,7 +309,10 @@ static void *my_DllGetClassObject(const void *clsid, const void *iid, void **out
     if (iid)
         guid_str(iid, is, sizeof is);
     r = fn ? fn(clsid, iid, out) : NULL;
-    plog("DllGetClassObject(clsid=%s) -> %p  [broadcast-core 接口创建 #%lu]", cs, r, n_cls);
+    hwprobe_plog("DllGetClassObject(clsid=%s, iid=%s) -> hr=0x%lx, factory=%p  [接口创建 #%lu]", cs, is,
+                 (unsigned long)(intptr_t)r, (r == 0 && out) ? *out : NULL, n_cls);
+    if (r == 0 && out && *out)
+        vthook_wrap_factory(out);   /* 之后 CreateInstance 与对象方法调用都会被观测 */
     return r;
 }
 
@@ -286,7 +323,7 @@ static int my_NvEncodeAPICreateInstance(void *functionList)
 
     n_nvenc_api++;
     r = fn ? fn(functionList) : -1;
-    plog("NvEncodeAPICreateInstance(%p) -> %d  [NVENC 被初始化 #%lu]%s",
+    hwprobe_plog("NvEncodeAPICreateInstance(%p) -> %d  [NVENC 被初始化 #%lu]%s",
          functionList, r, n_nvenc_api, r == 0 ? "" : "  <- 非 0 表示失败（随后必然回退软编）");
     return r;
 }
@@ -301,7 +338,7 @@ static int my_NvEncodeAPIGetMaxSupportedVersion(uint32_t *version)
     r = fn ? fn(&v) : -1;
     if (version && r == 0)
         *version = v;
-    plog("NvEncodeAPIGetMaxSupportedVersion -> %d, 版本 %u.%u  [驱动支持 NVENC]",
+    hwprobe_plog("NvEncodeAPIGetMaxSupportedVersion -> %d, 版本 %u.%u  [驱动支持 NVENC]",
          r, v >> 4, v & 0xf);
     return r;
 }
@@ -336,23 +373,24 @@ static void dump_map(void)
         nseen++;
     }
     fclose(f);
-    plog("--- 进程映射到的编码相关库（%d 个）---", nseen);
+    hwprobe_plog("--- 进程映射到的编码相关库（%d 个）---", nseen);
     for (i = 0; i < nseen; i++)
-        plog("    %s", seen[i]);
+        hwprobe_plog("    %s", seen[i]);
 }
 
 static void summary(void)
 {
-    plog("--- 汇总 ---");
-    plog("dlopen %lu 次（失败 %lu）；dlsym %lu 次；DllGetClassObject %lu 次",
+    hwprobe_plog("--- 汇总 ---");
+    hwprobe_plog("dlopen %lu 次（失败 %lu）；dlsym %lu 次；DllGetClassObject %lu 次",
          n_dlopen, n_dlopen_fail, n_dlsym, n_cls);
-    plog("后端加载情况：NVENC=%s CUDA=%s NVDEC=%s OpenH264(软编)=%s IntelQSV=%s AMF=%s vpx=%s x264=%s avcodec=%s",
+    hwprobe_plog("后端加载情况：NVENC=%s CUDA=%s NVDEC=%s OpenH264(软编)=%s IntelQSV=%s AMF=%s vpx=%s x264=%s avcodec=%s",
          seen_nvenc ? "是" : "否", seen_cuda ? "是" : "否", seen_cuvid ? "是" : "否",
          seen_openh264 ? "是" : "否", seen_mfx ? "是" : "否", seen_amf ? "是" : "否",
          seen_vpx ? "是" : "否", seen_x264 ? "是" : "否", seen_avcodec ? "是" : "否");
-    plog("NVENC 初始化调用 %lu 次；驱动能力查询 %lu 次", n_nvenc_api, n_nvenc_ver);
-    plog("判读：NVENC 初始化成功(返回 0) => 走了硬编；只有 OpenH264 且 NVENC 初始化 0 次 => 软编");
+    hwprobe_plog("NVENC 初始化调用 %lu 次；驱动能力查询 %lu 次", n_nvenc_api, n_nvenc_ver);
+    hwprobe_plog("判读：NVENC 初始化成功(返回 0) => 走了硬编；只有 OpenH264 且 NVENC 初始化 0 次 => 软编");
     dump_map();
+    vthook_summary();
 }
 
 static void on_sig(int sig)
@@ -373,16 +411,17 @@ __attribute__((constructor)) static void hwprobe_init(void)
         if (fd >= 0)
             logfd = fd;
     }
-    real_dlopen = lookup_real("dlopen");
-    real_dlsym = lookup_real("dlsym");
-    real_dlerror = lookup_real("dlerror");
-    real_dlmopen = lookup_real("dlmopen");
+    real_dlopen = hwprobe_lookup_real("dlopen");
+    real_dlsym = hwprobe_lookup_real("dlsym");
+    real_dlerror = hwprobe_lookup_real("dlerror");
+    real_dlmopen = hwprobe_lookup_real("dlmopen");
 
-    plog("=== hwprobe 已注入 pid=%d ===", (int)getpid());
+    vthook_init();
+    hwprobe_plog("=== hwprobe 已注入 pid=%d ===", (int)getpid());
     p = getenv("QQ_WAYLAND_FIX_ANGLE");
-    plog("环境：QQ_WAYLAND_FIX_ANGLE=%s", p ? p : "(未设)");
+    hwprobe_plog("环境：QQ_WAYLAND_FIX_ANGLE=%s", p ? p : "(未设)");
     p = getenv("LD_PRELOAD");
-    plog("环境：LD_PRELOAD=%s", p ? p : "(空)");
+    hwprobe_plog("环境：LD_PRELOAD=%s", p ? p : "(空)");
     atexit(summary);
     signal(SIGUSR1, on_sig);
 }
