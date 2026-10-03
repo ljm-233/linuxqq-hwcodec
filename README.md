@@ -306,32 +306,55 @@ dlsym/dlvsym 查找名 top8（共 4 种）：cos=2 sin=1 pow=1 NvEncodeAPICreate
 的 `Shmem`），共享时会一路涨到把机器冻死；跑在独显上，同样的堆积落在**显存（8 GB）**，机器不容易冻。
 注意这与"硬件**编码**"是两件事 —— 后者今天已证明用户侧改不了（见顶部结论）。
 
-**已知走不通的两条**（先前会话实测，别再试）：
-- 强制 NVIDIA **EGL**（`__EGL_VENDOR_LIBRARY_FILENAMES=10_nvidia.json`）：EGL 确实换成了 NVIDIA、
-  llvmpipe 消失、ppapi CPU 从 ~273% 降到 ~5%，**但对端没有画面**；`eglinfo` 的原因：
-  `Wayland platform: eglInitialize failed`（Mesa 在同一平台成功）
-- `DRI_PRIME=2`：被 Mesa 拒绝（`Should be < 2 (GPU devices count)`）
+### 判据：三条硬标准，缺一不可
 
-| 配置 | 改什么 | 期望 | 风险 |
+1. **收帧进程 `ppapi` 打开 `renderD129`**（其它子进程碰过不算 —— 堆积记在 ppapi 身上）
+2. **该进程 `llvmpipe` 线程数 = 0**（只要还有 llvmpipe，就是在软件渲染）
+3. **共享进行中显存明显上涨**（先 `mark` 记基线 → 开共享 → `verdict` 看差值）
+
+**为什么必须三条**：实测 `prime-1` 时 ppapi 确实打开了 `renderD129`，但同进程里
+**llvmpipe 线程还有 18 个**、VRAM 只有 32 MiB —— 只打开设备节点不等于真的在独显上干活。
+同理 `xwayland-nvidia` 那次 VRAM 涨了 356 MiB，**但涨在别的 qq 子进程上，ppapi 仍在 i915** ✗。
+只看到一个数字就下结论，会被假阳性骗。
+
+### 已实测失败的配置（别再试，死亡原因都量过）
+
+| 配置 | 做法 | 结果 |
+|---|---|---|
+| `baseline` | 什么都不改（你现在在用的） | 核显 + llvmpipe，画面正常（对照/回退用） |
+| `vulkan-nvidia` | 锁 NVIDIA Vulkan ICD（`VK_ICD_FILENAMES`/`VK_DRIVER_FILES`）+ `--use-angle=vulkan` | ✗ **ANGLE 仍挑 Intel 的 Vulkan**；`nvidia-smi` 里 qq 进程数 = 0；且画面变小 |
+| `angle-gl-nvidia` | `--use-gl=angle --use-angle=gl`（走 GLX/NVIDIA） | ✗ **GLX 需要 X11**，QQ 是原生 Wayland → 回退到 Mesa |
+| `prime-1` | `DRI_PRIME=1` | ✗ 变量生效、节点也开了，但**实际仍走 llvmpipe**（18 线程、VRAM 32 MiB） |
+| 强制 NVIDIA EGL（先前会话） | `__EGL_VENDOR_LIBRARY_FILENAMES=10_nvidia.json` | ✗ EGL 换成了 NVIDIA、llvmpipe 消失、CPU 从 273% 降到 5%，**但对端没有画面**；`eglinfo`：`Wayland platform: eglInitialize failed` |
+| `DRI_PRIME=2`（先前会话） | — | ✗ 被 Mesa 拒绝（`Should be < 2 (GPU devices count)`） |
+
+**共同死因**：在 niri + Wayland + 混合显卡下，Electron/ANGLE **自己决定用哪块 GPU**，环境变量拉不动它。
+
+### 还没试的两个（强制手段）
+
+| 配置 | 做法 | 期望 | 风险 |
 |---|---|---|---|
-| `baseline` | 什么都不改（= 你现在在用的） | 核显 + llvmpipe，画面正常 | 无（作为对照与回退） |
-| `vulkan-nvidia` | `VK_ICD_FILENAMES`/`VK_DRIVER_FILES` 锁 NVIDIA ICD + `QQ_WAYLAND_FIX_ANGLE=vulkan` | ANGLE 走 NVIDIA Vulkan，最可能真上独显 | **画面可能变小** —— `--use-angle=vulkan` 正是"视频画面缩放错乱"的元凶（你今天为此固化了 `QQ_WAYLAND_FIX_ANGLE=off`） |
-| `angle-gl-nvidia` | `QQ_WAYLAND_FIX_ANGLE=off` + 追加 `--use-gl=angle --use-angle=gl`（启动器会把参数原样透传） | 走 ANGLE 桌面 GL（经 GLX/NVIDIA），绕开 EGL 那个失败点 | GLX 在 Wayland 下不一定可用 |
-| `prime-1` | `DRI_PRIME=1` | Mesa 自己选设备 | 先前只试过 2/0，1 未试；可能仍落在核显 |
+| `xwayland-nvidia` | 追加 `--ozone-platform=x11`（启动器把参数原样透传，**后出现的同名参数覆盖前面的**），让 QQ 跑在 XWayland 下 | NVIDIA 的 **GLX 在 X11 下才可用**（Wayland 下 `eglInitialize` 失败）；这是混合显卡最常规的办法 | 共享功能在 XWayland 下的行为**未知**（`libqq-wl-portal.so` 是 Wayland 门户补丁）；画面可能异常 |
+| `bwrap-hide-igpu` | `bwrap --dev-bind / / --tmpfs /dev/dri --dev-bind /dev/dri/renderD129 …`：**让 QQ 只看得到 N 卡**（`/dev/nvidia*` 仍在，niri 是别的进程不受影响） | 不管 ANGLE 怎么挑，只有一块 GPU 可选 | QQ 可能因找不到预期设备而**完全不渲染** |
+| `xwayland-bwrap` | 上面两个叠加 | 前两个都单独失败时的最后一击 | 两者风险叠加 |
 
-**判据只有一条**：`verdict` 里**收帧进程 ppapi** 打开的是 `renderD129`（NVIDIA）。
-其它子进程碰过 renderD129 不算 —— 堆积记在 ppapi 身上。
+`bwrap` 隐藏核显的机制**已在本机验证**（不是推测）：命名空间里 `/dev/dri` 只剩 `renderD129`，
+`renderD128` 报"没有那个文件或目录"，而 `/dev/nvidia0`、`/dev/nvidiactl`、`/dev/nvidia-modeset`、
+`/dev/nvidia-uvm` 都还在 ✓
+
+### 怎么跑
 
 ```
-./try-gpu-config.sh verdict            # 只读：现在到底在哪个 GPU 上（随时可跑）
-./try-gpu-config.sh dry-run vulkan-nvidia   # 先看将要执行什么，不启动
-./try-gpu-config.sh vulkan-nvidia      # 用该配置启动（要求 QQ 已完全退出）
-./try-gpu-config.sh baseline           # 回到你现在这个正常状态
+./try-gpu-config.sh verdict                  # 只读：现在到底在哪个 GPU 上（随时可跑）
+./try-gpu-config.sh mark                     # 共享前记显存基线（判据 3 需要）
+./try-gpu-config.sh dry-run xwayland-nvidia  # 先看将要执行什么，不启动
+./try-gpu-config.sh xwayland-nvidia          # 用该配置启动（要求 QQ 已完全退出）
+./try-gpu-config.sh verdict                  # 开共享后跑，看三条硬标准
+./try-gpu-config.sh baseline                 # 回到你现在这个正常状态
 ```
 
-**两个目标可能冲突**：让 ANGLE 走 NVIDIA（`vulkan-nvidia`）与"画面不变小"（需要 `QQ_WAYLAND_FIX_ANGLE=off`）
-目前看是矛盾的。建议顺序：先试 `angle-gl-nvidia`（不碰 ANGLE 的 vulkan 后端，画面风险最小），
-再试 `vulkan-nvidia`（最可能上独显，但要接受画面可能变小）；**优先保证画面正常** —— 上不了独显只是
-"会冻机"的老问题（已有档位与刹车兜住），画面坏了共享就没法用了。
+**两个目标可能冲突**：让 ANGLE 走 NVIDIA（`vulkan-nvidia`）与"画面不变小"（需要
+`QQ_WAYLAND_FIX_ANGLE=off`）目前看是矛盾的。**优先保证画面正常** —— 上不了独显只是"会冻机"的
+老问题（已有 `saver` 档 + 刹车兜住，实测共享中 `Shmem` 平稳），画面坏了共享就直接不能用。
 
 本脚本**不会杀任何进程**：QQ 还在跑时它会拒绝启动（QQ 是单实例，不退出新实例不会接管）。
