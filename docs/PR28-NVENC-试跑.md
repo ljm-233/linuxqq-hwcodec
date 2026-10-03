@@ -282,3 +282,86 @@ return 0;
 **验证代价都很低**（都在 worktree 里改，别动主 clone）：
 ① 把回调挪到 DoEncode 返回之后触发（线程或延后）；② 强制 Baseline profile；
 ③ 若 ① 无效再动偏移。
+
+---
+
+## 变体试验：异步回调（`QQ_NVENC_ASYNCCB=1`）
+
+**已构建好，一个环境变量切换，不用换 .so。** 这是上面「第二嫌疑：同步回调」的最小验证。
+
+### 它改了什么
+
+| | 原 PR（默认，`ASYNCCB` 未设） | 本变体（`QQ_NVENC_ASYNCCB=1`） |
+|---|---|---|
+| 回调时机 | **在 `DoEncode` 里同步回调**，随后立即 `return 0` | **推迟到下一次 `DoEncode` 进入时补发** —— 也就是"上一次 DoEncode 已经返回之后" |
+| 递下去的 packet | **调用方给的那个 packet** (`void *pk = packet;`) | **我们自己的影子 packet**（先照抄调用方那份，再写 idx/qp/len/data 四个字段） |
+| 递下去的码流 | 直接指 NVENC 的输出缓冲 | **复制一份**再递下去 |
+
+**为什么必须复制码流**：`nv_encode()` 在返回前就调了 `nvEncUnlockBitstream(w->session, w->outbuf)`
+—— 那块缓冲在解锁后**不保证还有效**。同步回调时"刚解锁、还没被复用"通常没事，但**延后一帧再递下去，
+那块缓冲很可能已经被下一帧覆盖** ✗，所以变体里先 `memcpy` 到自己的缓冲再回调 ✓。
+
+**最后一帧不会丢**：`UnInit` 里会先补发挂起的那一帧 ✓。
+
+**默认行为完全不变**：`flag_on("QQ_NVENC_ASYNCCB", 0)` —— 不设这个变量就是原来那套同步回调 ✓。
+
+### 怎么跑（一条命令）
+
+```bash
+# 完全退出 QQ（托盘；环境变量只在启动时读一次）
+QQ_WAYLAND_FIX_ANGLE=off \
+LD_PRELOAD=$HOME/coding/linuxqq-hwcodec/libqq-nvenc.so \
+QQ_NVENC=1 QQ_NVENC_ACTIVE=1 QQ_NVENC_ASYNCCB=1 linuxqq-wayland-fix
+
+# 开共享，动着屏幕 30 秒，然后：
+cd ~/coding/linuxqq-hwcodec && ./nvenc-status.sh      # 应报「NVENC 在跑」
+grep -aE 'ASYNCCB|出帧|回调' /run/user/1000/linuxqq-wayland-fix.log | tail -12
+```
+
+日志里应能看到配对的两行（延迟 + 补发）：
+
+```
+[qq-nvenc pid=…] NVENC: [ASYNCCB] 延迟回调 idx=2 28259 字节 qp=45（本次 DoEncode 直接返回，下次进入时补发）
+[qq-nvenc pid=…] NVENC: [ASYNCCB] 补发上一帧回调 idx=2 len=28259
+[qq-nvenc pid=…] NVENC: [ASYNCCB] 补发回调已返回
+```
+
+### 三组对照（同档位、都动着屏幕）
+
+| 组 | 启动参数 | 看什么 | 结论 |
+|---|---|---|---|
+| A 同步（现状） | `QQ_NVENC=1 QQ_NVENC_ACTIVE=1` | 对端转圈/黑屏 | 复现已知问题 |
+| **B 异步（本变体）** | **加 `QQ_NVENC_ASYNCCB=1`** | **对端出现画面** = 命中病因 ✓ | 若仍转圈 → 回调时序不是病因 |
+| C 关掉 NVENC | 只 `QQ_NVENC=1`（或不注入） | 对端正常 | 对照组，证明"问题只在 NVENC 路径" |
+
+**成功判据**：B 组里**对端能看到画面且不卡**（同时 `nvenc-status.sh` 仍报"NVENC 在跑"）。
+
+### 如果 B 组也失败：把这几样留给作者
+
+1. `grep -aE 'ASYNCCB|出帧|回调|会话就绪' …log | tail -20`
+2. 同一次会话里 C 组的日志（对照）
+3. 对端现象（转圈 / 黑屏 / 花屏 / 卡住）+ 你这边看到的源帧尺寸与帧率
+4. 你这份 QQ 的版本号（`/opt/QQ/qq --version`）与 `libAVSDKPlugin.so` 的 sha256
+
+### 说明
+
+- 变体代码在 `/tmp/pr28-build` 这个 **worktree** 里（**未提交到上游**，也未碰主 clone）；改动已另存为
+  `patches/pr28-asynccb.patch`（`+94/-5`，只动 `src/qq-nvenc.c`）
+- 本变体**未经过真机共享验证**（构建与冒烟通过：`/bin/true`、`niri msg version` 不崩、开关默认关闭时行为不变）
+- 有新代码路径就有新风险：若 B 组里对端/本端出现异常，直接去掉 `QQ_NVENC_ASYNCCB=1` 即回到 A 组行为 ✓
+
+### 附：旁观模式 `-> data=… len=… idx=…` 的三种取值
+
+这条是**第 1 步（旁观模式）**的判读，用来先排除"字段偏移不匹配"这个头号嫌疑：
+
+| 看到 | 含义 | 下一步 |
+|---|---|---|
+| `data` 非空、`len` 合理（几千~几万字节）、`idx` 递增 | 偏移契约**对** ✓ | 排除偏移嫌疑 → 直接试本节的 B 组（异步回调） |
+| `data` 为空/极小，或 `len`=0 / 超大（>4 MB） | `+0x18` / `+0x14` 偏移**与你这版 QQ 不匹配** ✗ | 先改偏移（别试回调，试了也判不出来） |
+| `idx` 恒为 0 或不递增 | `+0x08` 不是帧号 ✗ | 下游可能按 idx 丢帧 → 也要先改偏移 |
+
+抓法（旁观模式，`QQ_NVENC=1`，不改行为）：
+
+```bash
+grep -aE '原实现回调|-> data=' /run/user/1000/linuxqq-wayland-fix.log | tail -8
+```
