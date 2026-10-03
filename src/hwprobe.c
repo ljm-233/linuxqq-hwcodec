@@ -60,7 +60,31 @@ void *hwprobe_real_dlsym(void *handle, const char *name)
 
 static void *cls_handle;   /* dlsym 请求 DllGetClassObject 时用的那个 handle */
 
+static char log_path[512];    /* HWPROBE_LOG 的副本：fd 被关掉时可以重开 */
+static int log_reopened = 0;  /* 每个进程只说明一次 */
+
 /* ---------- 工具 ---------- */
+
+/*
+ * 另写一份到 stderr（fd 2）。
+ * 修复版启动器把 QQ 的 stderr 重定向到它自己的日志（/run/user/1000/linuxqq-wayland-fix.log），
+ * 这条通道不受 Chromium 关 fd 的影响，用来回答"构造函数到底跑没跑"。
+ */
+static void plog_stderr(const char *fmt, ...)
+{
+    char buf[400];
+    int n;
+    va_list ap;
+
+    n = snprintf(buf, sizeof buf, "[hwprobe/err] ");
+    va_start(ap, fmt);
+    n += vsnprintf(buf + n, sizeof buf - n, fmt, ap);
+    va_end(ap);
+    if (n > (int)sizeof buf - 2)
+        n = (int)sizeof buf - 2;
+    buf[n++] = '\n';
+    (void)!write(2, buf, n);
+}
 
 void hwprobe_plog(const char *fmt, ...)
 {
@@ -71,6 +95,28 @@ void hwprobe_plog(const char *fmt, ...)
 
     if (logfd < 0)
         return;
+    /*
+     * 收帧进程（--type=ppapi）是 Electron 从主进程 **fork** 出来的：构造函数不会再跑，
+     * 而 Chromium 会关掉它不认识的文件描述符 —— 继承来的 logfd 就这么没了，日志全部丢失。
+     * （2026-10-03 实测：ppapi 进程里探针在、HWPROBE_LOG 也设了，却一行没写，
+     *   fd 表里也找不到那个日志文件。）所以每次写之前确认 fd 还活着，不活就重开。
+     */
+    if (fcntl(logfd, F_GETFD) < 0) {
+        int fd = log_path[0] ? open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644) : -1;
+        if (fd < 0)
+            return;
+        logfd = fd;
+        if (!log_reopened) {
+            log_reopened = 1;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            n = snprintf(buf, sizeof buf,
+                         "[hwprobe] %ld.%06ld 日志 fd 被继承后关闭，已重新打开（本进程 pid=%d "
+                         "多半是从主进程 fork 出来的）\n",
+                         (long)ts.tv_sec, ts.tv_nsec / 1000, (int)getpid());
+            (void)!write(logfd, buf, n);
+            plog_stderr("日志 fd 已重开 pid=%d（fork 出来的子进程）", (int)getpid());
+        }
+    }
     clock_gettime(CLOCK_MONOTONIC, &ts);
     n = snprintf(buf, sizeof buf, "[hwprobe] %ld.%06ld ", (long)ts.tv_sec, ts.tv_nsec / 1000);
     va_start(ap, fmt);
@@ -417,6 +463,8 @@ __attribute__((constructor)) static void hwprobe_init(void)
         int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0)
             logfd = fd;
+        /* 记下路径：fork 出来的子进程里 fd 会被 Chromium 关掉，那时按它重开 */
+        snprintf(log_path, sizeof log_path, "%s", path);
     }
     real_dlopen = hwprobe_lookup_real("dlopen");
     real_dlsym = hwprobe_lookup_real("dlsym");
@@ -454,6 +502,8 @@ __attribute__((constructor)) static void hwprobe_init(void)
 
     vthook_init();
     hwprobe_plog("=== hwprobe 已注入 pid=%d ===", (int)getpid());
+    /* stderr 那条通道用来确认"构造函数到底跑没跑"（启动器会把 QQ 的 stderr 收进自己的日志） */
+    plog_stderr("已注入 pid=%d cmdline=%s", (int)getpid(), cbuf[0] ? cbuf : "?");
     if (cbuf[0])
         hwprobe_plog("命令行：%s", cbuf);
     hwprobe_plog("父进程：%d", (int)getppid());
