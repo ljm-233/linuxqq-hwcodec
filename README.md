@@ -95,7 +95,20 @@ Phase 2 还要看这些（`HWPROBE_VTABLE=1` 时才有）：
 
 主进程 `/opt/QQ/qq` 是长命的，而汇总只在**进程退出时**才写 —— 于是"它到底有没有 dlopen
 broadcast-core、有没有走 DllGetClassObject"在日志里永远看不到（2026-10-03 的日志就是这样）。
-现在每个相关进程每隔一段时间写一行定长摘要（`write()`，不碰 stdio/malloc）：
+现在每个相关进程每隔一段时间写一行定长摘要（`write()`，不碰 stdio/malloc）。
+
+**惰性打印，不使用任何信号与定时器。** 摘要是在我们本来就会执行的地方顺手判断的
+（`dlopen` / `dlsym` / `DllGetClassObject` / NVENC 入口被调用时，距上次 ≥ `HWPROBE_PERIOD`
+就写一行）；没有这些调用就不打印 —— 这够用，因为要观测的正是这些调用。周期摘要只对
+"相关进程"生效（cmdline 含 `qq`/`ppapi`，或设了 `HWPROBE_ALL=1`）。
+
+> ⚠️ 早期版本用 `signal(SIGALRM)+alarm()` 实现这件事：本库被注入到**每一个子进程**里，
+> 于是每个进程 20 秒后都会收到 SIGALRM —— 默认动作是终止进程，**等于把宿主打死**。
+> 2026-10-03 用户实测：启动器被 SIGALRM 杀掉、QQ 根本没起来。所以本探针
+> **不安装任何信号处理、不使用任何定时器**（`grep -nE 'alarm|setitimer|timer_create|sigaction|signal *\(' src/` 应为空）。
+> 也因此**不再支持用 `SIGUSR1` 中途 dump**：需要中途数据就看周期摘要，或正常退出时的汇总。
+> 回归测试：`test/run-periodic-test.sh`（长命宿主 9 秒 + fork 子进程，断言宿主不被信号杀死、
+> 且周期摘要 ≥2 行）。
 
 ```
 [hwprobe] 周期汇总 pid=4132253 dlopen=0(失败 0) dlsym=0 DllGetClassObject=0 nvenc_api=0 nvenc_ver=0 broadcast-core=否 dlopen库数=0 编码库=0

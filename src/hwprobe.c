@@ -33,6 +33,8 @@
 static int logfd = 2;                 /* 默认 stderr；HWPROBE_LOG 可改 */
 static int log_all = 0;               /* HWPROBE_ALL=1 时记录所有 dlsym */
 static int period_secs = 0;            /* HWPROBE_PERIOD：秒；0 = 不周期汇总 */
+static long last_period_mono = 0;      /* 上次惰性周期摘要的单调时钟秒数 */
+static void maybe_periodic_summary(void);            /* HWPROBE_PERIOD：秒；0 = 不周期汇总 */
 
 /* 本进程 dlopen 过的库名（去重，环形）。2026-10-03：主进程是长命的，只在退出时
    才写汇总 —— 而"broadcast-core 到底在哪个进程、什么时候被加载"必须能当场看见。 */
@@ -343,6 +345,7 @@ void *dlopen(const char *file, int flags)
 
     wanted = interesting_lib(file);
     n_dlopen++;
+    maybe_periodic_summary();
     h = real_dlopen ? real_dlopen(file, flags) : NULL;
     if (!h) {
         n_dlopen_fail++;
@@ -426,6 +429,7 @@ void *dlsym(void *handle, const char *name)
     if (!real_dlsym)
         real_dlsym = hwprobe_lookup_real("dlsym");
     n_dlsym++;
+    maybe_periodic_summary();
 
     if (!route_special(handle, name, &r))
         r = real_dlsym ? real_dlsym(handle, name) : NULL;
@@ -518,6 +522,7 @@ HWPROBE_EXPORT void *DllGetClassObject(const void *clsid, const void *iid, void 
         fn = (bc && real_dlsym) ? real_dlsym(bc, "DllGetClassObject") : NULL;
     }
     n_cls++;
+    maybe_periodic_summary();
     if (clsid)
         guid_str(clsid, cs, sizeof cs);
     if (iid)
@@ -554,6 +559,7 @@ HWPROBE_EXPORT int NvEncodeAPICreateInstance(void *functionList)
     in_api = 1;
     fn = nvenc_real("NvEncodeAPICreateInstance");
     n_nvenc_api++;
+    maybe_periodic_summary();
     r = fn ? fn(functionList) : -1;
     in_api = 0;
     hwprobe_plog("NvEncodeAPICreateInstance(%p) -> %d  [NVENC 被初始化 #%lu]%s",
@@ -585,6 +591,7 @@ HWPROBE_EXPORT int NvEncodeAPIGetMaxSupportedVersion(uint32_t *version)
     in_ver = 1;
     fn = nvenc_real("NvEncodeAPIGetMaxSupportedVersion");
     n_nvenc_ver++;
+    maybe_periodic_summary();
     r = fn ? fn(&v) : -1;
     in_ver = 0;
     if (version && r == 0)
@@ -652,17 +659,41 @@ static void summary(void)
 }
 
 /*
- * 周期汇总：主进程（/opt/QQ/qq）是长命的，只在退出时才写汇总 —— 于是"它到底有没有
- * dlopen broadcast-core / 有没有走 DllGetClassObject"在日志里永远看不到。
- * 只写一行定长摘要，走 write()，不碰 stdio/malloc（信号处理里能用的就是这些）。
+ * 周期汇总（惰性）：主进程（/opt/QQ/qq）是长命的，只在退出时才写汇总 —— 于是"它到底
+ * 有没有 dlopen broadcast-core / 有没有走 DllGetClassObject"在日志里永远看不到。
+ *
+ * 实现方式：**不使用任何信号，也不使用任何定时器**。
+ * 早期版本用 signal(SIGALRM)+alarm() 做这件事，而本库被注入到每一个子进程里，于是
+ * 每个进程 20 秒后都会收到 SIGALRM —— 默认动作是终止进程，等于把宿主（QQ、乃至启动器
+ * 自己）打死。2026-10-03 用户实测：启动器被 SIGALRM 杀掉、QQ 根本没起来。
+ * 现在改为在本来就会执行的地方（dlopen / dlsym / DllGetClassObject / NVENC 入口）
+ * 顺手判断"距上次摘要是否够久"。没有这些调用就不打印 —— 这完全够用，因为要观测的
+ * 正是这些调用。
  */
-static void on_alarm(int sig)
+static long mono_now(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+    return (long)ts.tv_sec;
+}
+
+static void maybe_periodic_summary(void)
 {
     char b[320];
-    int n, i, nlibs = 0;
+    int n, i, nlibs;
+    long now;
     const char *bc = "否";
 
-    (void)sig;
+    if (period_secs <= 0)
+        return;
+    now = mono_now();
+    if (now == 0)
+        return;
+    if (last_period_mono != 0 && now - last_period_mono < period_secs)
+        return;
+    last_period_mono = now;
+
     for (i = 0; i < dl_names_n; i++)
         if (strstr(dl_names[i], "broadcast"))
             bc = "是";
@@ -676,14 +707,6 @@ static void on_alarm(int sig)
         n_nvenc_api, n_nvenc_ver, bc, dl_names_n, nlibs);
     if (n > 0)
         (void)!write(hwprobe_logfd(), b, (size_t)(n < (int)sizeof b ? n : (int)sizeof b - 1));
-    alarm((unsigned)period_secs);
-}
-
-static void on_sig(int sig)
-{
-    (void)sig;
-    summary();
-    _exit(0);
 }
 
 /* 只有 cmdline 里带 qq / ppapi 的进程才值得输出那一整套汇总块 */
@@ -752,13 +775,10 @@ __attribute__((constructor)) static void hwprobe_init(void)
     p = getenv("LD_PRELOAD");
     hwprobe_plog("环境：LD_PRELOAD=%s", p ? p : "(空)");
     atexit(summary);
-    signal(SIGUSR1, on_sig);
     {
         const char *ps = getenv("HWPROBE_PERIOD");
-        period_secs = (ps && *ps) ? atoi(ps) : 20;   /* 默认 20 秒一条 */
-        if (period_secs > 0) {
-            signal(SIGALRM, on_alarm);
-            alarm((unsigned)period_secs);
-        }
+        period_secs = (ps && *ps) ? atoi(ps) : 20;   /* 默认 20 秒一条；<=0 关闭 */
+        /* 记下起点：第一次周期摘要在 period 秒之后，而不是立刻 */
+        last_period_mono = mono_now();
     }
 }
