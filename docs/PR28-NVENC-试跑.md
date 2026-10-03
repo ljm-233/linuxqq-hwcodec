@@ -43,7 +43,7 @@ cd /tmp/pr28-build && make NVENC_INC=/tmp/nv-codec-headers/include libqq-nvenc.s
 （`export LD_PRELOAD="$preload${LD_PRELOAD:+:$LD_PRELOAD}"`），所以直接叠加：
 
 ```bash
-LD_PRELOAD=/tmp/pr28-build/libqq-nvenc.so QQ_NVENC=1 linuxqq-wayland-fix
+LD_PRELOAD=$HOME/coding/linuxqq-hwcodec/libqq-nvenc.so QQ_NVENC=1 linuxqq-wayland-fix
 ```
 
 三个开关（库内读取）：
@@ -60,7 +60,7 @@ LD_PRELOAD=/tmp/pr28-build/libqq-nvenc.so QQ_NVENC=1 linuxqq-wayland-fix
 
 ```bash
 # 完全退出 QQ（托盘），然后：
-LD_PRELOAD=/tmp/pr28-build/libqq-nvenc.so QQ_NVENC=1 linuxqq-wayland-fix
+LD_PRELOAD=$HOME/coding/linuxqq-hwcodec/libqq-nvenc.so QQ_NVENC=1 linuxqq-wayland-fix
 # 开一次共享 30 秒
 grep -aE 'ppapi 进程，等待 AVSDK 加载|NVENC' /run/user/1000/linuxqq-wayland-fix.log | tail -20
 ```
@@ -71,7 +71,7 @@ grep -aE 'ppapi 进程，等待 AVSDK 加载|NVENC' /run/user/1000/linuxqq-wayla
 ### 第 2 步：启用 NVENC（同时验证"真的在用"）
 
 ```bash
-LD_PRELOAD=/tmp/pr28-build/libqq-nvenc.so QQ_NVENC=1 QQ_NVENC_ACTIVE=1 linuxqq-wayland-fix
+LD_PRELOAD=$HOME/coding/linuxqq-hwcodec/libqq-nvenc.so QQ_NVENC=1 QQ_NVENC_ACTIVE=1 linuxqq-wayland-fix
 # 开共享 30 秒，然后：
 grep -aE 'NVENC: (会话就绪|出流|出帧|回调)' /run/user/1000/linuxqq-wayland-fix.log | tail -10
 P=$(pgrep -f 'type=ppapi' | head -1)
