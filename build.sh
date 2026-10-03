@@ -7,7 +7,16 @@ gcc -O2 -shared -fPIC -Wall -Wextra -o "$here/libhwprobe.so" \
 	"$here/src/hwprobe.c" "$here/src/vthook.c" -ldl
 
 echo "编好了: $here/libhwprobe.so"
-echo "--- 包装的符号（应能看到 dlopen/dlsym/dlmopen 以及 NVENC 入口）"
-nm -D --defined-only "$here/libhwprobe.so" | grep -oE '(dlopen|dlmopen|dlsym)$' | sed 's/^/    /' || true
-echo "    （DllGetClassObject / NvEncodeAPI* 是 static 包装，经 dlsym 转发，不出现在动态符号表里 —— 正常）"
+echo "--- 动态符号：dlopen/dlmopen/dlsym（dlsym 那条路要用）"
+nm -D --defined-only "$here/libhwprobe.so" | awk '$2 == "T" { print $3 }' |
+	grep -xE 'dlopen|dlmopen|dlsym' | sed 's/^/    /' || true
+echo "--- 动态符号：被介入的目标（必须是导出的同名符号；否则直接链接的调用方绕过我们）"
+targets=$(nm -D --defined-only "$here/libhwprobe.so" | awk '$2 == "T" { print $3 }' |
+	grep -E '^(DllGetClassObject|NvEncodeAPICreateInstance|NvEncodeAPIGetMaxSupportedVersion)$' || true)
+if [ -n "$targets" ]; then
+	printf '%s\n' "$targets" | sed 's/^/  ✓ /'
+else
+	echo "    ✗ 三个目标符号没有导出 —— LD_PRELOAD 介入不会生效（检查 static / visibility）"
+	exit 1
+fi
 echo "--- 下一步：$here/linuxqq-hwcodec-probe"

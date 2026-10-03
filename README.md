@@ -54,6 +54,43 @@ Phase 2 还要看这些（`HWPROBE_VTABLE=1` 时才有）：
 | `vtable[3] 调用 1 次` 这类热点统计 | 哪个槽位被反复调用（每帧都调的多半是"送一帧"） |
 | `vtable hook 跳过：…不可写` | 安全阀生效（宁可不挂钩，也不冒险写坏 QQ 内存） |
 
+## 为什么这三个符号必须"导出"
+
+`LD_PRELOAD` 的介入靠**动态链接器按名字解析**，所以我们要拦的符号必须自己也是**同名动态符号**：
+
+| 名字 | 为什么 |
+|---|---|
+| `DllGetClassObject` | broadcast-core 唯一的入口。`libAVSDKPlugin.so` 是**直接链接**它走 COM 的（`QRTCServiceInterfaceWrapper::InitBroadcastCore`），全程没有 `dlsym` —— 只做"static 包装 + dlsym 转发"的话，这条路**根本不经过我们** |
+| `NvEncodeAPICreateInstance` / `NvEncodeAPIGetMaxSupportedVersion` | 同上：直接链接时只有导出符号才拦得住 |
+
+以前这三个是 `static`，`nm -D` 里看不到 —— 于是接口创建、NVENC 初始化全都观测不到（日志里
+`vtable` 一直 0 行）。现在 `./build.sh` 结束会直接把导出情况打出来：
+
+```
+--- 动态符号：被介入的目标（必须是导出的同名符号；否则直接链接的调用方绕过我们）
+  ✓ DllGetClassObject
+  ✓ NvEncodeAPICreateInstance
+  ✓ NvEncodeAPIGetMaxSupportedVersion
+```
+
+**怎么知道这次走的是哪条路**（日志里各有一行）：
+
+| 日志 | 含义 |
+|---|---|
+| `符号介入路径：DllGetClassObject 被调用 —— 导出符号介入生效（动态链接器直接解析到我们，全程没有 dlsym）` | 真实调用方走的就是这条 |
+| `符号介入路径：DllGetClassObject 是调用方用 dlsym 取走的（交给我们的实现）` | 调用方先 dlsym 拿指针 |
+
+两个坑记在这，免得再踩：
+
+1. **转发目标只能用 `RTLD_NEXT`**，绝不能拿 `RTLD_DEFAULT` 兜底 —— 我们自己就导出这个名字，
+   `RTLD_DEFAULT` 会解析回我们 → **无限递归 → 栈溢出**（实测 rc=139）。
+   所以 `next_definition()` 只走 `RTLD_NEXT`，并再挡一道"结果等于自己就作废"。
+2. `dlvsym(handle, name, NULL)` 是**未定义行为**（glibc 把 version 标成 nonnull），
+   在无版本符号上直接段错误。无版本符号要用真正的 `dlsym`。
+
+回归测试：`test/direct.c` 故意**直接链接**假 COM 模块（不走 dlsym），配合
+`test/run-test.sh` 的 D 段断言"导出符号介入生效 + 工厂照样被代理"。
+
 ## 实现要点：转发桩为什么不挪栈
 
 常见做法是把参数寄存器压到栈上再调真实函数 —— 那样 `rsp` 跑到调用者的栈参数下面去了，

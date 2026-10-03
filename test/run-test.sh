@@ -62,6 +62,22 @@ n=$(grep -cE "vtable\[[0-9]+\] (call|ret )" "$logC")
 if [ "$n" -le 6 ]; then echo "  ✓ 日志被限流（vtable 行 $n ≤ 6）"; else echo "  ✗ 限流没生效（$n 行）"; fail=1; fi
 
 echo
+echo "=== D. 直接链接路径（导出符号介入 —— 真实调用方走的就是这条）"
+gcc -O2 -o direct direct.c -L. -lfakecom -Wl,-rpath,'$ORIGIN' || exit 1
+logD=$(mktemp /tmp/hwprobe-D-XXXX.log)
+outD=$(LD_PRELOAD=../libhwprobe.so HWPROBE_ALL=1 HWPROBE_VTABLE=1 HWPROBE_LOG="$logD" ./direct 2>&1)
+rcD=$?
+expect_output "$outD" "$rcD"
+grep -q "导出符号介入生效" "$logD"          ; chk $? "日志确认走的是导出符号路径（全程没有 dlsym）"
+grep -q "DllGetClassObject(clsid=" "$logD"  ; chk $? "我们的 DllGetClassObject 确实被介入了"
+grep -q "已代理 IClassFactory" "$logD"      ; chk $? "这条路上工厂照样被代理"
+if grep -q "用 dlsym 取走的" "$logD"; then
+    echo "  ✗ 直接链接却走了 dlsym 路径（说明导出没生效）"; fail=1
+else
+    echo "  ✓ 调用方没有用 dlsym 取符号"
+fi
+
+echo
 echo "=== 日志样本（A 模式）"
 grep -E "vtable\[[0-9]+\]" "$logA" | head -6 | sed 's/^/  /'
 echo

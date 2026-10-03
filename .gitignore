@@ -3,3 +3,4 @@
 probe-*.log
 test/driver
 test/libfakecom.so
+test/direct

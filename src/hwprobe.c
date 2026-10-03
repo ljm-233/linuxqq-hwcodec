@@ -35,6 +35,9 @@ static int log_all = 0;               /* HWPROBE_ALL=1 时记录所有 dlsym */
 static int in_boot = 0;               /* dlvsym 引导期间的重入保护 */
 
 static unsigned long n_dlopen, n_dlopen_fail, n_dlsym, n_cls, n_nvenc_api, n_nvenc_ver;
+/* 经 dlsym 把我们的实现交出去的次数：用来分辨"调用方是 dlsym 拿的"还是"动态链接器直接解析到我们" */
+static unsigned long n_gave_cls, n_gave_nvenc_api, n_gave_nvenc_ver;
+static int path_cls_logged, path_api_logged, path_ver_logged;
 static int seen_nvenc, seen_cuda, seen_cuvid, seen_mfx, seen_amf, seen_openh264, seen_vpx, seen_x264, seen_avcodec;
 
 static void *(*real_dlopen)(const char *, int);
@@ -125,8 +128,9 @@ void hwprobe_plog(const char *fmt, ...)
     if (n > (int)sizeof buf - 2)
         n = (int)sizeof buf - 2;
     buf[n++] = '\n';
-    if (write(logfd, buf, n) < 0)
-        ; /* 日志失败也不该影响宿主进程 */
+    if (write(logfd, buf, n) < 0) {
+        /* 日志失败也不该影响宿主进程 */
+    }
 }
 
 /* 用没有被包装的 dlvsym 取真实函数，避免递归进我们自己的 dlsym */
@@ -147,10 +151,13 @@ void *hwprobe_lookup_real(const char *name)
     in_boot = 1;
     for (i = 0; vers[i] && !p; i++)
         p = dlvsym(RTLD_NEXT, name, vers[i]);
-    if (!p)
-        p = dlvsym(RTLD_NEXT, name, NULL); /* version=NULL 等价于 dlsym：最后的兜底 */
-    if (!p)
-        p = dlvsym(RTLD_DEFAULT, name, NULL);
+    /* 下面这两步以前写成 dlvsym(..., NULL)：glibc 把 version 标成 nonnull，
+     * 传 NULL 是未定义行为 —— 实测在无版本符号（假 COM 模块）上直接段错误。
+     * 改成用真正的 dlsym；real_dlsym 还没解析出来时（正是本函数在干的事）就跳过。 */
+    if (!p && real_dlsym)
+        p = real_dlsym(RTLD_NEXT, name);
+    if (!p && real_dlsym)
+        p = real_dlsym(RTLD_DEFAULT, name);
     in_boot = 0;
     return p;
 }
@@ -214,11 +221,59 @@ static int interesting_sym(const char *n)
     return 0;
 }
 
-/* ---------- 被包装的导出符号（先声明，dlsym 里要返回它们） ---------- */
+/* ---------- 被包装的导出符号 ----------
+ *
+ * 这三个必须是**真正的动态符号**（同名、非 static、default 可见性）：
+ * LD_PRELOAD 的介入靠的是动态链接器按名字解析 —— 只要调用方是"直接链接"到
+ * broadcast-core / libnvidia-encode（例如 libAVSDKPlugin.so 里
+ * _ZN27QRTCServiceInterfaceWrapper17InitBroadcastCoreEv 走 COM 那条路），
+ * 就不会有任何 dlsym 调用，static 包装 + dlsym 转发那条路**根本不参与**。
+ * （2026-10-03 实测：nm -D 里没有这三个名字，于是接口创建、NVENC 初始化全都观测不到。）
+ * dlsym 转发那条路继续保留，作为调用方主动 dlsym 时的兜底。
+ */
+#define HWPROBE_EXPORT __attribute__((visibility("default")))
 
-static void *my_DllGetClassObject(const void *clsid, const void *iid, void **out);
-static int my_NvEncodeAPICreateInstance(void *functionList);
-static int my_NvEncodeAPIGetMaxSupportedVersion(uint32_t *version);
+HWPROBE_EXPORT void *DllGetClassObject(const void *clsid, const void *iid, void **out);
+HWPROBE_EXPORT int NvEncodeAPICreateInstance(void *functionList);
+HWPROBE_EXPORT int NvEncodeAPIGetMaxSupportedVersion(uint32_t *version);
+
+/* 取"查找顺序里我们后面那个同名定义"。**绝不能用 RTLD_DEFAULT 兜底**：
+ * 我们自己就导出了这个名字，RTLD_DEFAULT 会解析回我们 → 无限递归 → 栈溢出
+ * （2026-10-03 实测：直接链接的测试里 rc=139 段错误就是这么来的）。
+ * 这里只走 RTLD_NEXT，并且再挡一道 self 判断。 */
+static void *next_definition(const char *name, void *self)
+{
+    static const char *vers[] = { "GLIBC_2.2.5", "GLIBC_2.34", "GLIBC_2.17", "GLIBC_2.3.4",
+                                  "GLIBC_2.35", NULL };
+    void *p = NULL;
+    int i;
+
+    for (i = 0; vers[i] && !p; i++)
+        p = dlvsym(RTLD_NEXT, name, vers[i]);
+    /* 无版本符号（例如测试用的假 COM 模块）只能用 dlsym；
+     * 绝不能写 dlvsym(..., NULL) —— glibc 标了 nonnull，实测直接段错误。 */
+    if (!p && real_dlsym)
+        p = real_dlsym(RTLD_NEXT, name);
+    if (p == self)
+        p = NULL;
+    return p;
+}
+
+/* 重入保护：万一真实实现没取到而调用方又转回来，宁可报错也不要递归到爆栈 */
+static int in_cls, in_api, in_ver;
+
+/* 调用方所在的模块：介入的符号是通用名字（DllGetClassObject），不能一律转发给
+ * broadcast-core —— 别的 COM 插件也导出这个名字。用 dladdr 认准"谁在调我们"。 */
+static void *caller_module(void *retaddr)
+{
+    Dl_info info;
+    void *h = NULL;
+
+    if (!retaddr || !real_dlopen || !dladdr(retaddr, &info) || !info.dli_fname)
+        return NULL;
+    h = real_dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+    return h;
+}
 
 /* NVENC 的真实入口：从我们自己的 handle 取，不动调用方的 handle */
 static void *nvenc_handle(void)
@@ -228,10 +283,16 @@ static void *nvenc_handle(void)
 
     if (!h && !tried) {
         tried = 1;
-        if (real_dlopen)
-            h = real_dlopen("libnvidia-encode.so.1", RTLD_NOW | RTLD_NOLOAD);
-        if (!h && real_dlopen)
+        if (!real_dlopen)
+            return NULL;
+        /* 先 NOLOAD：qq 自己已经加载过就别重复加载；再退回正式加载 */
+        h = real_dlopen("libnvidia-encode.so.1", RTLD_NOW | RTLD_NOLOAD);
+        if (!h)
+            h = real_dlopen("libnvidia-encode.so", RTLD_NOW | RTLD_NOLOAD);
+        if (!h)
             h = real_dlopen("libnvidia-encode.so.1", RTLD_NOW);
+        if (!h)
+            h = real_dlopen("libnvidia-encode.so", RTLD_NOW);
     }
     return h;
 }
@@ -302,12 +363,29 @@ void *dlsym(void *handle, const char *name)
 
     if (name && strcmp(name, "DllGetClassObject") == 0) {
         cls_handle = handle;   /* 真实实现未必在 broadcast-core 里（测试用的假 COM 库也是这条路） */
-        r = (void *)my_DllGetClassObject;
+        n_gave_cls++;
+        r = (void *)DllGetClassObject;
+        if (!path_cls_logged) {
+            path_cls_logged = 1;
+            hwprobe_plog("符号介入路径：DllGetClassObject 是调用方用 dlsym 取走的（交给我们的实现）");
+        }
     }
-    else if (name && strcmp(name, "NvEncodeAPICreateInstance") == 0)
-        r = (void *)my_NvEncodeAPICreateInstance;
-    else if (name && strcmp(name, "NvEncodeAPIGetMaxSupportedVersion") == 0)
-        r = (void *)my_NvEncodeAPIGetMaxSupportedVersion;
+    else if (name && strcmp(name, "NvEncodeAPICreateInstance") == 0) {
+        n_gave_nvenc_api++;
+        r = (void *)NvEncodeAPICreateInstance;
+        if (!path_api_logged) {
+            path_api_logged = 1;
+            hwprobe_plog("符号介入路径：NvEncodeAPICreateInstance 是调用方用 dlsym 取走的");
+        }
+    }
+    else if (name && strcmp(name, "NvEncodeAPIGetMaxSupportedVersion") == 0) {
+        n_gave_nvenc_ver++;
+        r = (void *)NvEncodeAPIGetMaxSupportedVersion;
+        if (!path_ver_logged) {
+            path_ver_logged = 1;
+            hwprobe_plog("符号介入路径：NvEncodeAPIGetMaxSupportedVersion 是调用方用 dlsym 取走的");
+        }
+    }
     else
         r = real_dlsym ? real_dlsym(handle, name) : NULL;
 
@@ -327,27 +405,67 @@ static void guid_str(const unsigned char *g, char *out, size_t n)
              g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
 }
 
-/* broadcast-core 唯一可 hook 的导出符号：接口创建时机 */
-static void *my_DllGetClassObject(const void *clsid, const void *iid, void **out)
+/* broadcast-core 唯一可 hook 的导出符号：接口创建时机。
+ * 这个函数有两条到达路径：调用方直接链接（动态链接器解析到我们）或先 dlsym 拿指针。 */
+HWPROBE_EXPORT void *DllGetClassObject(const void *clsid, const void *iid, void **out)
 {
     void *(*fn)(const void *, const void *, void **);
     void *r;
     char cs[64] = "?", is[64] = "?";
 
-    /* 真实实现：优先用 dlsym 时记录的那个 handle，取不到再退回 broadcast-core.so */
+    if (!real_dlopen)
+        real_dlopen = hwprobe_lookup_real("dlopen");
+    if (!real_dlsym)
+        real_dlsym = hwprobe_lookup_real("dlsym");
+
+    if (!path_cls_logged) {
+        path_cls_logged = 1;
+        if (n_gave_cls)
+            hwprobe_plog("符号介入路径：DllGetClassObject 被调用（调用方先前用 dlsym 取过它）");
+        else
+            hwprobe_plog("符号介入路径：DllGetClassObject 被调用 —— 导出符号介入生效"
+                         "（动态链接器直接解析到我们，全程没有 dlsym）");
+    }
+
+    if (in_cls) {
+        hwprobe_plog("DllGetClassObject 重入且真实实现没取到 —— 返回失败，避免无限递归");
+        return NULL;
+    }
+    in_cls = 1;
+    /* 真实实现按可靠性依次尝试：
+     *   1) RTLD_NEXT —— 直接链接时唯一正确的做法：取"查找顺序里我们后面那个定义"
+     *      （libfakecom / broadcast-core 都在这条路上）；我们被 preload 在它前面。
+     *   2) dlsym 那次记下来的 handle —— 目标库是 RTLD_LOCAL 加载时 RTLD_NEXT 看不见它
+     *   3) 调用方自己的模块（dladdr 认人）—— 库调库、且那个库自己就实现该符号时
+     *   4) broadcast-core.so（NOLOAD 优先，取不到再正式加载）
+     * 通用名字必须这样一层层退，否则别的 COM 插件的同名符号会被错送到 broadcast-core。
+     */
     {
+        void *p = next_definition("DllGetClassObject", (void *)DllGetClassObject);
+
+        fn = p ? (void *(*)(const void *, const void *, void **))p : NULL;
+    }
+    if (!fn && cls_handle && real_dlsym)
+        fn = real_dlsym(cls_handle, "DllGetClassObject");
+    if (!fn) {
+        void *h = caller_module(__builtin_return_address(0));
+
+        if (h && real_dlsym)
+            fn = real_dlsym(h, "DllGetClassObject");
+    }
+    if (!fn) {
         static void *bc;
         static int tried;
 
-        fn = (cls_handle && real_dlsym) ? real_dlsym(cls_handle, "DllGetClassObject") : NULL;
-        if (!fn) {
-            if (!tried) {
-                tried = 1;
-                if (real_dlopen)
-                    bc = real_dlopen("broadcast-core.so", RTLD_NOW | RTLD_NOLOAD);
+        if (!tried) {
+            tried = 1;
+            if (real_dlopen) {
+                bc = real_dlopen("broadcast-core.so", RTLD_NOW | RTLD_NOLOAD);
+                if (!bc)
+                    bc = real_dlopen("broadcast-core.so", RTLD_NOW);
             }
-            fn = (bc && real_dlsym) ? real_dlsym(bc, "DllGetClassObject") : NULL;
         }
+        fn = (bc && real_dlsym) ? real_dlsym(bc, "DllGetClassObject") : NULL;
     }
     n_cls++;
     if (clsid)
@@ -355,6 +473,7 @@ static void *my_DllGetClassObject(const void *clsid, const void *iid, void **out
     if (iid)
         guid_str(iid, is, sizeof is);
     r = fn ? fn(clsid, iid, out) : NULL;
+    in_cls = 0;
     hwprobe_plog("DllGetClassObject(clsid=%s, iid=%s) -> hr=0x%lx, factory=%p  [接口创建 #%lu]", cs, is,
                  (unsigned long)(intptr_t)r, (r == 0 && out) ? *out : NULL, n_cls);
     if (r == 0 && out && *out)
@@ -362,26 +481,62 @@ static void *my_DllGetClassObject(const void *clsid, const void *iid, void **out
     return r;
 }
 
-static int my_NvEncodeAPICreateInstance(void *functionList)
+HWPROBE_EXPORT int NvEncodeAPICreateInstance(void *functionList)
 {
-    int (*fn)(void *) = nvenc_real("NvEncodeAPICreateInstance");
+    int (*fn)(void *);
     int r;
 
+    if (!real_dlopen)
+        real_dlopen = hwprobe_lookup_real("dlopen");
+    if (!real_dlsym)
+        real_dlsym = hwprobe_lookup_real("dlsym");
+    if (!path_api_logged) {
+        path_api_logged = 1;
+        if (n_gave_nvenc_api)
+            hwprobe_plog("符号介入路径：NvEncodeAPICreateInstance 被调用（dlsym 取走的）");
+        else
+            hwprobe_plog("符号介入路径：NvEncodeAPICreateInstance 被调用 —— 导出符号介入生效");
+    }
+    if (in_api) {
+        hwprobe_plog("NvEncodeAPICreateInstance 重入 —— 返回失败，避免无限递归");
+        return -1;
+    }
+    in_api = 1;
+    fn = nvenc_real("NvEncodeAPICreateInstance");
     n_nvenc_api++;
     r = fn ? fn(functionList) : -1;
+    in_api = 0;
     hwprobe_plog("NvEncodeAPICreateInstance(%p) -> %d  [NVENC 被初始化 #%lu]%s",
          functionList, r, n_nvenc_api, r == 0 ? "" : "  <- 非 0 表示失败（随后必然回退软编）");
     return r;
 }
 
-static int my_NvEncodeAPIGetMaxSupportedVersion(uint32_t *version)
+HWPROBE_EXPORT int NvEncodeAPIGetMaxSupportedVersion(uint32_t *version)
 {
-    int (*fn)(uint32_t *) = nvenc_real("NvEncodeAPIGetMaxSupportedVersion");
+    int (*fn)(uint32_t *);
     int r;
     uint32_t v = 0;
 
+    if (!real_dlopen)
+        real_dlopen = hwprobe_lookup_real("dlopen");
+    if (!real_dlsym)
+        real_dlsym = hwprobe_lookup_real("dlsym");
+    if (!path_ver_logged) {
+        path_ver_logged = 1;
+        if (n_gave_nvenc_ver)
+            hwprobe_plog("符号介入路径：NvEncodeAPIGetMaxSupportedVersion 被调用（dlsym 取走的）");
+        else
+            hwprobe_plog("符号介入路径：NvEncodeAPIGetMaxSupportedVersion 被调用 —— 导出符号介入生效");
+    }
+    if (in_ver) {
+        hwprobe_plog("NvEncodeAPIGetMaxSupportedVersion 重入 —— 返回失败，避免无限递归");
+        return -1;
+    }
+    in_ver = 1;
+    fn = nvenc_real("NvEncodeAPIGetMaxSupportedVersion");
     n_nvenc_ver++;
     r = fn ? fn(&v) : -1;
+    in_ver = 0;
     if (version && r == 0)
         *version = v;
     hwprobe_plog("NvEncodeAPIGetMaxSupportedVersion -> %d, 版本 %u.%u  [驱动支持 NVENC]",
