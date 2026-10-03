@@ -166,3 +166,86 @@ QQ 更新导致入口字节变化 → **拒绝挂钩**并写日志（走原来�
 | 「**用户侧做不到**硬件编码」 | ❌ **被本 PR 证伪** —— 社区用 inline hook 直接换掉了编码器 |
 | 「硬编要等腾讯」 | ⚠️ 改为：**腾讯不给也能做**，代价是对 QQ 版本敏感的实验性 hook |
 | `uiUseHw` / `broadcast-core` 的 COM 路径 | ❌ **已被本 PR 证伪**：`libAVSDKPlugin.so` 里没有任何 NVENC/QSV/AMF 引用（静态 OpenH264），`AVSDK_SetHWAbility` 打开也没用（没有硬件实现可指） |
+
+## 接管成功但对端转圈/黑屏：已查明的三点
+
+**现象**（实测）：NVENC 真接管了 —— `libnvidia-encode` 5 段 / `libcuda` 6 段映射，日志有
+`NVENC: 出流 28259 字节 qp=45 type=0`、`NVENC 出帧 idx=2/3 … → 回调已返回`；本机 Shmem 稳定 0 MB/s。
+**但对端收不到可解画面（转圈）。**
+
+### 已排除：会话几何与源帧不一致
+
+PR 的会话几何**取自送进来的帧**，不是取自 Init 参数（`src/qq-nvenc.c`）：
+
+```c
+wpx = get32((char *)f + VF_OFF_W);   /* VideoFrame: +0x00 宽 / +0x04 高 */
+hpx = get32((char *)f + VF_OFF_H);
+if (!w->nv_on || wpx != w->w || hpx != w->h)        /* 尺寸一变就重开会话 */
+    nv_open(w, wpx, hpx, w->fps ? w->fps : 30, w->kbps ? w->kbps : 2000);
+```
+
+本次共享协商到 **2560×1600 @60**（niri journal：`size: spa_rectangle { width: 2560, height: 1600 }`、
+`framerate: spa_fraction { num: 60 }`），会话即按 2560×1600 开 —— **与源帧一致 ✓**
+所以"会话几何 ≠ 源帧几何"**不是**病因。作者自测的 `1920×1088` 是他**源帧本身**的尺寸，不是对齐产物。
+
+### 头号嫌疑：VideoPacket 字段偏移可能不匹配你这份 QQ
+
+PR 只填四个字段：
+
+```
+PKT_OFF_IDX  0x08  帧号      PKT_OFF_QP   0x10  qp
+PKT_OFF_LEN  0x14  长度      PKT_OFF_DATA 0x18  码流指针（64 位）
+```
+
+而**旁观模式**打印的"原实现 DoEncode 之后 packet 前 0x60"里（你自己的那次日志）：
+
+```
++0x08: 25 00 00 00                = 37           ← 与 PR 的 IDX 对得上 ✓
++0x10: 25 00 00 00                = 37           ← QP？
++0x14: 3d b1 01 00                = 110909       ← 长度 ✓
++0x18: 40 40 c0 03                = 0x03c04040   ← ✗ 这不像指针
++0x28: d8 19 de 5c 29 7f 00 00    = 0x7f295cde19d8  ← ✓ 这才像堆指针
+```
+
+**若下游读的是 +0x28、而 PR 把指针写在 +0x18**，下游拿到的是垃圾/空数据 → 对端解不出画面 ✓ 与现象吻合。
+
+**一次运行就能判死，不用改代码**：跑**旁观模式**（`QQ_NVENC=1`），日志里 PR 会转印原实现回调拿到的
+packet 并打印它按 +0x18 解析的结果：
+
+```
+[qq-nvenc pid=…] 原实现回调第 N 次: ctx=… *pp_packet=…
+[qq-nvenc pid=…]   cb packet 前 0x40: …
+[qq-nvenc pid=…]   -> data=0x… len=… idx=…
+```
+
+看 `-> data=` 是不是一个**有效指针**（`0x7f…`）、`len` 是否与实际码流长度相符：
+
+- **data 有效、len 合理** → +0x18 是对的，这条排除，转下面两条
+- **data 为 0 或 `0x3c04040` 这类** → **偏移不匹配实锤** → 在 worktree 里把 `PKT_OFF_DATA` 改成 `0x28`，重建再试
+
+### 第二嫌疑：同步回调
+
+原实现是异步（DoEncode 返回后由编码线程回调），PR 是**在 DoEncode 里同步回调后立即 return 0**：
+
+```c
+((pkt_cb_fn)w->cb0)(w->cb_ctx, &pk, w->cb1);
+return 0;
+```
+
+若下游要求"回调发生在 DoEncode 返回之后"（或对 packet 生命周期另有假设），帧可能被丢弃。
+**代价小**：在 worktree 里把回调挪到线程（或返回后再触发）重建再试。
+
+### 第三嫌疑：码流参数
+
+PR 用 NVENC 默认（High profile）+ 每帧带 SPS/PPS + Annex-B；原实现是 OpenH264。
+对端通常能接 Annex-B，但 **profile/level 或 SPS/PPS 频率**也可能被拒。
+低成本验证：在 `nv_open()` 里给 `encodeCodecConfig.h264Config` 强制 **Baseline / Constrained Baseline**，重建再试。
+
+### 下一步（按代价从低到高）
+
+1. **旁观模式跑一次，抓 `-> data=… len=… idx=…` 那几行** —— 一条命令判定头号嫌疑
+2. **换个共享几何再试**（`niri-portal-cast-tune 1080p`，或**共享单个窗口**让源帧不是 2560×1600）：对端能看到就说明与尺寸相关 ✓
+3. worktree 里试小改：`PKT_OFF_DATA` 改 0x28 / 强制 Baseline / 回调异步化
+4. 都不行 → 这是 PR 的实验性缺陷；把上面三条证据（含 `-> data=` 行）留给作者（**是否联系由用户决定**）
+
+> 本节全部基于**只读**源码分析 + 已有日志；未改上游代码、未杀进程、未向上游发任何评论。
