@@ -91,6 +91,45 @@ Phase 2 还要看这些（`HWPROBE_VTABLE=1` 时才有）：
 回归测试：`test/direct.c` 故意**直接链接**假 COM 模块（不走 dlsym），配合
 `test/run-test.sh` 的 D 段断言"导出符号介入生效 + 工厂照样被代理"。
 
+## 长命进程也要能当场看到计数（周期汇总）
+
+主进程 `/opt/QQ/qq` 是长命的，而汇总只在**进程退出时**才写 —— 于是"它到底有没有 dlopen
+broadcast-core、有没有走 DllGetClassObject"在日志里永远看不到（2026-10-03 的日志就是这样）。
+现在每个相关进程每隔一段时间写一行定长摘要（`write()`，不碰 stdio/malloc）：
+
+```
+[hwprobe] 周期汇总 pid=4132253 dlopen=0(失败 0) dlsym=0 DllGetClassObject=0 nvenc_api=0 nvenc_ver=0 broadcast-core=否 dlopen库数=0 编码库=0
+```
+
+- 默认 20 秒一条；`HWPROBE_PERIOD=1` 可改成 1 秒（调试用），`=0` 关闭
+- 汇总里新增 **`--- 本进程 dlopen 过的库（N 个）---`**：库名去重列表，这样"谁在什么时候
+  加载了 broadcast-core"一眼可见（之前只记次数，名字全丢）
+
+## 故意不包 `dlvsym`
+
+试过包 `dlvsym`（想让"调用方用版本化查找取符号"那条路也能被介入），**结果是破坏性的**：
+glibc 自己会用它做版本探测，而我们的包装在解析不到真实实现时返回 `nil`：
+
+```
+dlvsym(0xffff...ffff, "dlopen", "GLIBC_2.34") -> (nil) [没找到]
+```
+
+动态加载链整体退化（`test/run-test.sh` 段 D 当场失败）。**结论：`dlvsym` 属于 glibc 内部机制，
+不碰**；目标符号靠"导出同名符号"那条路介入。
+
+## 一个被数据推翻的推断（别再去主进程钩）
+
+曾经推断"COM 对象是在主进程里创建、ppapi 由 fork 继承，所以要在主进程里钩"。实测**不成立**：
+在一次真正的共享中，自检给出
+
+```
+自检：ppapi(pid=3955126) 探针=在 修复库=在 broadcast-core=在 共享=进行中 | 主进程(pid=3952917) 探针=在 | 加载 broadcast-core 的进程: 3955126
+```
+
+**broadcast-core 只出现在 ppapi 进程里**，主进程根本没有它 —— 代码不在那儿，COM 对象也不可能
+在那儿创建。所以钩子该在**收帧进程**里生效，自检也从"只报 ppapi"改成**同时报主进程的探针状态
+和所有加载了 broadcast-core 的进程**（别假定一定是 ppapi）。
+
 ## 实现要点：转发桩为什么不挪栈
 
 常见做法是把参数寄存器压到栈上再调真实函数 —— 那样 `rsp` 跑到调用者的栈参数下面去了，

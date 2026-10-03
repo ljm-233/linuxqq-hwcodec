@@ -32,6 +32,13 @@
 
 static int logfd = 2;                 /* 默认 stderr；HWPROBE_LOG 可改 */
 static int log_all = 0;               /* HWPROBE_ALL=1 时记录所有 dlsym */
+static int period_secs = 0;            /* HWPROBE_PERIOD：秒；0 = 不周期汇总 */
+
+/* 本进程 dlopen 过的库名（去重，环形）。2026-10-03：主进程是长命的，只在退出时
+   才写汇总 —— 而"broadcast-core 到底在哪个进程、什么时候被加载"必须能当场看见。 */
+#define HWPROBE_RING 48
+static char dl_names[HWPROBE_RING][64];
+static int dl_names_n;
 static int in_boot = 0;               /* dlvsym 引导期间的重入保护 */
 
 static unsigned long n_dlopen, n_dlopen_fail, n_dlsym, n_cls, n_nvenc_api, n_nvenc_ver;
@@ -173,6 +180,21 @@ static const char *base(const char *path)
 }
 
 /* 记录我们关心的后端库是否被加载过 */
+static void note_dl_name(const char *file)
+{
+    const char *b;
+    int i;
+
+    if (!file || !*file)
+        return;
+    b = base(file);
+    for (i = 0; i < dl_names_n; i++)
+        if (strcmp(dl_names[i], b) == 0)
+            return;
+    if (dl_names_n < HWPROBE_RING)
+        snprintf(dl_names[dl_names_n++], sizeof dl_names[0], "%s", b);
+}
+
 static void note_lib(const char *file, int ok)
 {
     const char *b = base(file);
@@ -331,6 +353,9 @@ void *dlopen(const char *file, int flags)
         }
     }
     note_lib(file, h != NULL);
+    note_dl_name(file);
+    if (file && (strstr(file, "broadcast") || strstr(file, "AVSDK")))
+        hwprobe_plog("dlopen 命中目标：\"%s\" -> %s%s", base(file), h ? "成功" : "失败", err);
     if (wanted)
         hwprobe_plog("dlopen(\"%s\", 0x%x) -> %s%s", base(file), flags, h ? "成功" : "失败", err);
     else if (log_all)
@@ -348,9 +373,50 @@ void *dlmopen(long nsid, const char *file, int flags)
         return NULL;
     h = real_dlmopen(nsid, file, flags);
     note_lib(file, h != NULL);
+    note_dl_name(file);
     if (interesting_lib(file) || log_all)
         hwprobe_plog("dlmopen(%ld, \"%s\", 0x%x) -> %s", nsid, base(file), flags, h ? "成功" : "失败");
     return h;
+}
+
+/*
+ * 三个目标符号的路由：dlsym 与 dlvsym 都要走这里（返回 1 = 已处理）。
+ * 2026-10-03：日志里 dlsym 一直是 0 次，而 Chromium 在 glibc 上也会用 dlvsym 取
+ * 版本化符号 —— 只包 dlsym 会整条漏掉。
+ */
+static int route_special(void *handle, const char *name, void **out)
+{
+    if (!name)
+        return 0;
+    if (strcmp(name, "DllGetClassObject") == 0) {
+        cls_handle = handle;
+        n_gave_cls++;
+        *out = (void *)DllGetClassObject;
+        if (!path_cls_logged) {
+            path_cls_logged = 1;
+            hwprobe_plog("符号介入路径：DllGetClassObject 被调用方取走（交给我们的实现）");
+        }
+        return 1;
+    }
+    if (strcmp(name, "NvEncodeAPICreateInstance") == 0) {
+        n_gave_nvenc_api++;
+        *out = (void *)NvEncodeAPICreateInstance;
+        if (!path_api_logged) {
+            path_api_logged = 1;
+            hwprobe_plog("符号介入路径：NvEncodeAPICreateInstance 被调用方取走");
+        }
+        return 1;
+    }
+    if (strcmp(name, "NvEncodeAPIGetMaxSupportedVersion") == 0) {
+        n_gave_nvenc_ver++;
+        *out = (void *)NvEncodeAPIGetMaxSupportedVersion;
+        if (!path_ver_logged) {
+            path_ver_logged = 1;
+            hwprobe_plog("符号介入路径：NvEncodeAPIGetMaxSupportedVersion 被调用方取走");
+        }
+        return 1;
+    }
+    return 0;
 }
 
 void *dlsym(void *handle, const char *name)
@@ -361,32 +427,7 @@ void *dlsym(void *handle, const char *name)
         real_dlsym = hwprobe_lookup_real("dlsym");
     n_dlsym++;
 
-    if (name && strcmp(name, "DllGetClassObject") == 0) {
-        cls_handle = handle;   /* 真实实现未必在 broadcast-core 里（测试用的假 COM 库也是这条路） */
-        n_gave_cls++;
-        r = (void *)DllGetClassObject;
-        if (!path_cls_logged) {
-            path_cls_logged = 1;
-            hwprobe_plog("符号介入路径：DllGetClassObject 是调用方用 dlsym 取走的（交给我们的实现）");
-        }
-    }
-    else if (name && strcmp(name, "NvEncodeAPICreateInstance") == 0) {
-        n_gave_nvenc_api++;
-        r = (void *)NvEncodeAPICreateInstance;
-        if (!path_api_logged) {
-            path_api_logged = 1;
-            hwprobe_plog("符号介入路径：NvEncodeAPICreateInstance 是调用方用 dlsym 取走的");
-        }
-    }
-    else if (name && strcmp(name, "NvEncodeAPIGetMaxSupportedVersion") == 0) {
-        n_gave_nvenc_ver++;
-        r = (void *)NvEncodeAPIGetMaxSupportedVersion;
-        if (!path_ver_logged) {
-            path_ver_logged = 1;
-            hwprobe_plog("符号介入路径：NvEncodeAPIGetMaxSupportedVersion 是调用方用 dlsym 取走的");
-        }
-    }
-    else
+    if (!route_special(handle, name, &r))
         r = real_dlsym ? real_dlsym(handle, name) : NULL;
 
     if (interesting_sym(name))
@@ -394,6 +435,15 @@ void *dlsym(void *handle, const char *name)
              r ? "" : " [没找到]");
     return r;
 }
+
+/*
+ * 关于 dlvsym：**故意不包**。
+ * 2026-10-03 试过包它（想让"调用方用 dlvsym 取版本化符号"那条路也能被介入），
+ * 结果 glibc 自己会用它做版本探测：
+ *     dlvsym(0xffff...ffff, "dlopen", "GLIBC_2.34") -> (nil)
+ * 我们解析不到真实实现时返回 nil，动态加载链整体退化（test/run-test.sh 段 D 当场挂）。
+ * 结论：dlvsym 属于 glibc 内部机制，不碰；目标符号靠"导出同名符号"那条路介入。
+ */
 
 /* ---------- 被包装的目标符号 ---------- */
 
@@ -590,8 +640,43 @@ static void summary(void)
          seen_vpx ? "是" : "否", seen_x264 ? "是" : "否", seen_avcodec ? "是" : "否");
     hwprobe_plog("NVENC 初始化调用 %lu 次；驱动能力查询 %lu 次", n_nvenc_api, n_nvenc_ver);
     hwprobe_plog("判读：NVENC 初始化成功(返回 0) => 走了硬编；只有 OpenH264 且 NVENC 初始化 0 次 => 软编");
+    {
+        int i;
+        hwprobe_plog("--- 本进程 dlopen 过的库（%d 个%s）---", dl_names_n,
+                     dl_names_n >= HWPROBE_RING ? "，已达上限" : "");
+        for (i = 0; i < dl_names_n; i++)
+            hwprobe_plog("    %s", dl_names[i]);
+    }
     dump_map();
     vthook_summary();
+}
+
+/*
+ * 周期汇总：主进程（/opt/QQ/qq）是长命的，只在退出时才写汇总 —— 于是"它到底有没有
+ * dlopen broadcast-core / 有没有走 DllGetClassObject"在日志里永远看不到。
+ * 只写一行定长摘要，走 write()，不碰 stdio/malloc（信号处理里能用的就是这些）。
+ */
+static void on_alarm(int sig)
+{
+    char b[320];
+    int n, i, nlibs = 0;
+    const char *bc = "否";
+
+    (void)sig;
+    for (i = 0; i < dl_names_n; i++)
+        if (strstr(dl_names[i], "broadcast"))
+            bc = "是";
+    nlibs = (seen_nvenc ? 1 : 0) + (seen_cuda ? 1 : 0) + (seen_cuvid ? 1 : 0) +
+            (seen_openh264 ? 1 : 0) + (seen_mfx ? 1 : 0) + (seen_amf ? 1 : 0) +
+            (seen_vpx ? 1 : 0) + (seen_x264 ? 1 : 0) + (seen_avcodec ? 1 : 0);
+    n = snprintf(b, sizeof b,
+        "[hwprobe] 周期汇总 pid=%d dlopen=%lu(失败 %lu) dlsym=%lu DllGetClassObject=%lu "
+        "nvenc_api=%lu nvenc_ver=%lu broadcast-core=%s dlopen库数=%d 编码库=%d\n",
+        (int)getpid(), n_dlopen, n_dlopen_fail, n_dlsym, n_cls,
+        n_nvenc_api, n_nvenc_ver, bc, dl_names_n, nlibs);
+    if (n > 0)
+        (void)!write(hwprobe_logfd(), b, (size_t)(n < (int)sizeof b ? n : (int)sizeof b - 1));
+    alarm((unsigned)period_secs);
 }
 
 static void on_sig(int sig)
@@ -668,4 +753,12 @@ __attribute__((constructor)) static void hwprobe_init(void)
     hwprobe_plog("环境：LD_PRELOAD=%s", p ? p : "(空)");
     atexit(summary);
     signal(SIGUSR1, on_sig);
+    {
+        const char *ps = getenv("HWPROBE_PERIOD");
+        period_secs = (ps && *ps) ? atoi(ps) : 20;   /* 默认 20 秒一条 */
+        if (period_secs > 0) {
+            signal(SIGALRM, on_alarm);
+            alarm((unsigned)period_secs);
+        }
+    }
 }

@@ -7,7 +7,7 @@ gcc -O2 -shared -fPIC -Wall -Wextra -o "$here/libhwprobe.so" \
 	"$here/src/hwprobe.c" "$here/src/vthook.c" -ldl
 
 echo "编好了: $here/libhwprobe.so"
-echo "--- 动态符号：dlopen/dlmopen/dlsym（dlsym 那条路要用）"
+echo "--- 动态符号：dlopen/dlmopen/dlsym/dlvsym（dlsym 那条路要用）"
 nm -D --defined-only "$here/libhwprobe.so" | awk '$2 == "T" { print $3 }' |
 	grep -xE 'dlopen|dlmopen|dlsym' | sed 's/^/    /' || true
 echo "--- 动态符号：被介入的目标（必须是导出的同名符号；否则直接链接的调用方绕过我们）"
