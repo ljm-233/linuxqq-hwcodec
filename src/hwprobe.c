@@ -418,6 +418,25 @@ __attribute__((constructor)) static void hwprobe_init(void)
 
     vthook_init();
     hwprobe_plog("=== hwprobe 已注入 pid=%d ===", (int)getpid());
+    /*
+     * 同一份日志里有几十个进程，只记 pid 分不清哪个块是哪个进程
+     * （2026-10-03：Phase 2 的日志因此无法判断收帧进程有没有被覆盖）。
+     */
+    {
+        char cbuf[512];
+        int cfd = open("/proc/self/cmdline", O_RDONLY);
+        ssize_t cn = cfd >= 0 ? read(cfd, cbuf, sizeof(cbuf) - 1) : -1;
+        ssize_t ci;
+        if (cfd >= 0) close(cfd);
+        if (cn > 0) {
+            cbuf[cn] = '\0';
+            for (ci = 0; ci < cn - 1; ci++)
+                if (cbuf[ci] == '\0') cbuf[ci] = ' ';
+            if (cn > 260) cbuf[260] = '\0';
+            hwprobe_plog("命令行：%s", cbuf);
+        }
+        hwprobe_plog("父进程：%d", (int)getppid());
+    }
     p = getenv("QQ_WAYLAND_FIX_ANGLE");
     hwprobe_plog("环境：QQ_WAYLAND_FIX_ANGLE=%s", p ? p : "(未设)");
     p = getenv("LD_PRELOAD");

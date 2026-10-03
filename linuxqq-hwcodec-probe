@@ -40,4 +40,57 @@ else
 	printf 'COM 虚表观测：未启用（要看编码器选择点就加 HWPROBE_VTABLE=1 重启 QQ）\n' >&2
 
 fi
+# ---------------------------------------------------------------------------
+# 自检：确认探针到底进了哪个进程、以及共享有没有真的跑起来
+#   （2026-10-03 的教训：日志里几十个进程块，没有自检就分不清收帧进程有没有被覆盖）
+selfcheck_once() {
+	local p pp fix bc share line verdict
+	p=$(pgrep -f 'type=ppapi' 2>/dev/null | head -1)
+	if [ -z "$p" ]; then
+		printf '自检：还没找到 --type=ppapi 收帧进程（QQ 未启动或还没开过共享）\n'
+		return 1
+	fi
+	pp=不在; fix=不在; bc=不在
+	grep -qs 'libhwprobe\.so' "/proc/$p/maps" && pp=在
+	grep -qs 'libqq-wl-portal\.so' "/proc/$p/maps" && fix=在
+	grep -qs 'broadcast-core\.so' "/proc/$p/maps" && bc=在
+	share=未开始
+	pw-dump 2>/dev/null | grep -q 'Stream/Output/Video' && share=进行中
+	line="自检：收帧进程 ppapi(pid=$p) 探针=$pp 修复库=$fix broadcast-core=$bc 共享=$share"
+	printf '%s\n' "$line"
+	if [ "$pp" = 不在 ]; then
+		verdict="自检结论：探针没有进入收帧进程 —— 这次日志看不到编码器选择（请务必用本脚本启动 QQ）"
+	elif [ "$bc" = 不在 ] && [ "$share" = 进行中 ]; then
+		verdict="自检结论：正在共享但 broadcast-core 未加载 —— 编码还没开始，稍等再看"
+	elif [ "$bc" = 在 ]; then
+		verdict="自检结论：探针已随 broadcast-core 在收帧进程里 —— 这份日志有用，可以回传"
+	else
+		verdict="自检结论：探针在收帧进程里，但共享还没开始（开一次共享再看）"
+	fi
+	printf '%s\n' "$verdict"
+	return 0
+}
+
+watch_ppapi() {   # 后台跑：状态变化才写一行，最长 10 分钟
+	local i prev="" now
+	for i in $(seq 1 120); do
+		now=$(selfcheck_once 2>/dev/null | head -1)
+		if [ -n "$now" ] && [ "$now" != "$prev" ]; then
+			printf '%s %s\n' "$(date '+%F %T')" "$now" >>"$HWPROBE_LOG" 2>/dev/null
+			prev="$now"
+		fi
+		sleep 5
+	done
+}
+
+case "${1:-}" in
+	--selfcheck-once) selfcheck_once; exit $? ;;
+	--selfcheck)      echo "监控中，日志: $HWPROBE_LOG"; watch_ppapi; exit 0 ;;
+esac
+
+# 启动前先跑一次，并把结果写进日志；之后每 5 秒复查一次（只读 /proc 与 pw-dump，不碰任何进程）
+selfcheck_once >>"$HWPROBE_LOG" 2>/dev/null || true
+watch_ppapi &
+printf '自检已启动：若收帧进程里没有探针，日志里会明确写出来（不用猜）\n' >&2
+
 exec linuxqq-wayland-fix "$@"

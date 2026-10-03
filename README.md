@@ -82,3 +82,16 @@ $ test/run-test.sh
 - [niri-portal-cast](https://github.com/ljm-233/niri-portal-cast)：合成器侧（让 niri 的共享对 Electron 可用 + 限帧率/分辨率 + 内存刹车）
 - [wayland-cast-doctor](https://github.com/ljm-233/wayland-cast-doctor)：排查共享不出画面的诊断脚本
 - [linuxqq-wayland-fix](https://github.com/SHORiN-KiWATA/linuxqq-wayland-fix)：QQ 客户端侧注入修复（本项目的 hook 写法参考它）
+
+## 先确认探针进了哪个进程（每次跑完先看这两行）
+
+日志里有几十个进程块，**先找自检结论**：
+
+    自检：收帧进程 ppapi(pid=…) 探针=在 修复库=在 broadcast-core=在 共享=进行中
+    自检结论：探针已随 broadcast-core 在收帧进程里 —— 这份日志有用，可以回传
+
+- `探针=不在` → 这次日志看不到编码器选择，**必须用本脚本启动 QQ**（用平时的方式启动，探针不会在里面）
+- `broadcast-core=不在` 且 `共享=进行中` → 编码还没真正开始，等几秒再看
+- 每个进程块现在都带 `命令行：…` 和 `父进程：N`，不用再猜哪块是哪个进程
+
+不想启动 QQ 只想看现状：`./linuxqq-hwcodec-probe --selfcheck-once`
