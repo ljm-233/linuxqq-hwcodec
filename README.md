@@ -329,6 +329,8 @@ dlsym/dlvsym 查找名 top8（共 4 种）：cos=2 sin=1 pow=1 NvEncodeAPICreate
 | `vulkan-nvidia` | 锁 NVIDIA Vulkan ICD（`VK_ICD_FILENAMES`/`VK_DRIVER_FILES`）+ `--use-angle=vulkan` | ✗ **ANGLE 仍挑 Intel 的 Vulkan**；`nvidia-smi` 里 qq 进程数 = 0；且画面变小 |
 | `angle-gl-nvidia` | `--use-gl=angle --use-angle=gl`（走 GLX/NVIDIA） | ✗ **GLX 需要 X11**，QQ 是原生 Wayland → 回退到 Mesa |
 | `prime-1` | `DRI_PRIME=1` | ✗ 变量生效、节点也开了，但**实际仍走 llvmpipe**（18 线程、VRAM 32 MiB） |
+| `bwrap-hide-igpu` | 命名空间里**只剩 `renderD129`** | ✗ 它宁可 **llvmpipe 软件渲染**也不上 N 卡（共享时 18 线程、VRAM 相对基线 **-27 MiB**） |
+| `xwayland-bwrap` | X11 + 只暴露 N 卡（最后一击） | ✗ 同上：ppapi 仍走核显/软件路径，共享期间 VRAM **+167 MiB 且涨在别的子进程**，`nvidia-smi` 里 qq = 0 |
 | 强制 NVIDIA EGL（先前会话） | `__EGL_VENDOR_LIBRARY_FILENAMES=10_nvidia.json` | ✗ EGL 换成了 NVIDIA、llvmpipe 消失、CPU 从 273% 降到 5%，**但对端没有画面**；`eglinfo`：`Wayland platform: eglInitialize failed` |
 | `DRI_PRIME=2`（先前会话） | — | ✗ 被 Mesa 拒绝（`Should be < 2 (GPU devices count)`） |
 
