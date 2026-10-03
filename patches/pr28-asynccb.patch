@@ -1,5 +1,5 @@
 diff --git a/src/qq-nvenc.c b/src/qq-nvenc.c
-index 95f4bac..8133a47 100644
+index 95f4bac..eae8c4e 100644
 --- a/src/qq-nvenc.c
 +++ b/src/qq-nvenc.c
 @@ -30,6 +30,7 @@
@@ -43,7 +43,21 @@ index 95f4bac..8133a47 100644
  #define MAX_WRAPPED 8
  static struct wrapped wrapped[MAX_WRAPPED];
  static pthread_mutex_t wrap_lock = PTHREAD_MUTEX_INITIALIZER;
-@@ -576,10 +595,61 @@ static int our_uninit(void *self)
+@@ -320,6 +339,13 @@ static void nv_close(struct wrapped *w)
+     }
+     w->session = w->inbuf = w->outbuf = NULL;
+     w->nv_on = 0;
++    /* 变体自己的两块缓冲：有挂起帧时不能释放（补发还要用） */
++    if (!w->pend) {
++        free(w->cb_copy);
++        free(w->pend_shadow);
++        w->cb_copy = w->pend_shadow = NULL;
++        w->cb_cap = 0;
++    }
+ }
+ 
+ static int nv_open(struct wrapped *w, int wpx, int hpx, int fps, int kbps)
+@@ -576,10 +602,61 @@ static int our_uninit(void *self)
      if (!w)
          return -1;
      orig = (uninit_fn)w->orig_vtable[VT_OFF_UNINIT];
@@ -105,7 +119,7 @@ index 95f4bac..8133a47 100644
  static int our_encode(void *self, VideoFrame *frame, VideoPacket *packet, void *user)
  {
      struct wrapped *w = find_wrapped(self);
-@@ -589,6 +659,9 @@ static int our_encode(void *self, VideoFrame *frame, VideoPacket *packet, void *
+@@ -589,6 +666,9 @@ static int our_encode(void *self, VideoFrame *frame, VideoPacket *packet, void *
          return -1;
      orig = (encode_fn)w->orig_vtable[VT_OFF_ENCODE];
  
@@ -115,7 +129,7 @@ index 95f4bac..8133a47 100644
      /* 记录（只在采样窗口内） */
      if (w->encode_calls < 3) {
          LOG("DoEncode(self=%p frame=%p packet=%p user=%p) 第 %d 次【前】宽=%u 高=%u",
-@@ -617,10 +690,24 @@ static int our_encode(void *self, VideoFrame *frame, VideoPacket *packet, void *
+@@ -617,10 +697,24 @@ static int our_encode(void *self, VideoFrame *frame, VideoPacket *packet, void *
              if (w->encode_calls <= 4)
                  LOG("NVENC 出帧 idx=%lld %s %u 字节 qp=%u -> 回调 ctx=%p cb=%p",
                      idx, is_idr ? "IDR" : "P", sz, qp, w->cb_ctx, w->cb0);
@@ -144,7 +158,7 @@ index 95f4bac..8133a47 100644
          }
          LOG("NVENC: 本帧失败，之后回落原实现");
          w->nv_dead = 1;
-@@ -872,10 +959,12 @@ static void qq_nvenc_init(void)
+@@ -872,10 +966,12 @@ static void qq_nvenc_init(void)
          return;
      probe_dump = flag_on("QQ_NVENC_PROBE_DUMP", 1);
      nv_active = flag_on("QQ_NVENC_ACTIVE", 0);
