@@ -520,3 +520,32 @@ grep -aE '封装=' /run/user/1000/linuxqq-wayland-fix.log | tail -5
 
 `test/fixkey-ps-test.sh` —— **把源码里的 `fixkey_grab_ps()` / `fixkey_build()` 按大括号配平切出来**、配最小 shim 编译运行（测的是真代码，不是重写一份）：
 4/3 字节起始码抠取、纯 P 帧不抠、已有缓存不重复、垃圾输入安全、前缀拼装正确、已带参数集不重复补、70KB 大帧容量增长不越界 —— **15 项全过** ✓
+
+## 会话几何：为什么会出现 1200×1920（宽高颠倒）
+
+**实测**：多个编码器对象里，一个开成 `1920x1200 @23`（正确，用户屏幕 16:10），另一个开成 `1200x1920`（颠倒）✗ → 接收端按横屏协商、却收到竖屏 SPS → 解不出 → 转圈。
+
+**判据（行距不会骗人）**：PR 读的是 `VideoFrame` 头的 `+0x00`(宽) / `+0x04`(高)，而 Y 平面行距在 `+0x18`。
+- 若某对象 `ypitch == 高 && ypitch != 宽` → **宽高读反了**（真实宽度 = ypitch）
+- 若 `ypitch == 宽` → 这个流本来就是竖的，**不是 bug**
+
+代码里已有这行诊断（前 3 帧各打一次）：
+
+```bash
+grep -a '开始编码' /run/user/1000/linuxqq-wayland-fix.log | head -6
+# 形状：NVENC: 开始编码 obj=0x… 第1帧 会话=WxH 帧头=WxH ypitch=… uvpitch=…
+```
+
+**修法**：`QQ_NVENC_GEOM_FIX=1`（默认关 = 原行为）。开启后，当行距表明宽高读反时按 `(ypitch, 帧头宽)` 重开会话，并打
+`[GEOM] 行距表明宽高读反：帧头 1200x1920 ypitch=1920 -> 会话按 1920x1200 开`。
+
+**用户命令**：
+
+```bash
+QQ_WAYLAND_FIX_ANGLE=off LD_PRELOAD=$HOME/coding/linuxqq-hwcodec/libqq-nvenc.so \
+QQ_NVENC=1 QQ_NVENC_ACTIVE=1 QQ_NVENC_FIXKEY=1 QQ_NVENC_GEOM_FIX=1 QQ_NVENC_HEXDUMP=1 \
+linuxqq-wayland-fix
+# 成功判据：对端出现画面；日志里出现 [GEOM] 修正行且会话尺寸变成 1920x1200
+```
+
+**离线验证**：`geom_fix()` 抠出单测 6 项全过（读反→换回、本来就横→不动、真竖屏→不动、无行距→不动、零尺寸→不动、开关关闭→不动）。

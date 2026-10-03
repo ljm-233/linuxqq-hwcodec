@@ -1,0 +1,616 @@
+diff --git a/src/qq-nvenc.c b/src/qq-nvenc.c
+index 95f4bac..e8ee4de 100644
+--- a/src/qq-nvenc.c
++++ b/src/qq-nvenc.c
+@@ -30,6 +30,11 @@
+  *   QQ_NVENC=1              在 ppapi 里挂钩并旁观（透传，行为与不注入一致）
+  *   QQ_NVENC_ACTIVE=1       真正用 NVENC 编码（默认关，失败自动回落原实现）
+  *   QQ_NVENC_PROBE_DUMP=0   只挂钩、不打字节
++ *   QQ_NVENC_ASYNCCB=1     把回调推迟到 DoEncode 返回之后（默认 0 = 与原实现一致的在 DoEncode 内同步回调）
++ *   QQ_NVENC_HEXDUMP=1     逐帧打印【两条路径】码流前 16 字节 + NAL 解析（Annex-B/AVCC、SPS/PPS、profile）
++ *                          —— 只打印、不改行为，用来判断"接收端解不出来"是不是封装/参数不一致
++ *   QQ_NVENC_BASELINE=1    强制 H.264 Baseline profile（CAVLC、VUI 清零、去 AUD）
++ *                          —— 有些接收/转发链路只吃基线档；默认 0 = 维持 preset 的 High
+  */
+ #define _GNU_SOURCE
+ #include <dlfcn.h>
+@@ -93,6 +98,12 @@ static uintptr_t avsdk_base;
+ static void *trampoline;                  /* 原实现（前 14 字节 + 跳回） */
+ static int probe_dump = 1;
+ static int nv_active;                     /* 是否真的用 NVENC */
++static int nv_async_cb;                  /* QQ_NVENC_ASYNCCB：回调是否推迟到 DoEncode 返回之后 */
++static int nv_hexdump;                   /* QQ_NVENC_HEXDUMP：打印两条路径的码流首部与 NAL 解析 */
++static int nv_baseline;                  /* QQ_NVENC_BASELINE：强制 H.264 Baseline profile */
++static int nv_fixkey;                    /* QQ_NVENC_FIXKEY：保证 SPS/PPS + 周期性 IDR，让接收端起播 */
++static int nv_idr_interval = 60;         /* QQ_NVENC_IDR_INTERVAL：每多少帧强制一次 IDR（默认 60） */
++static int nv_reopen_idr;                /* QQ_NVENC_REOPEN_IDR：驱动忽略 FORCEIDR 时重开会话兜底 */
+ static int hooked;
+ 
+ /* ---------- 环境开关 ---------- */
+@@ -268,10 +279,38 @@ struct wrapped {
+     long frame_idx;
+     int force_idr;
+ 
++    /* FIXKEY：实测驱动只给 AUD + 非 IDR（没有 SPS/PPS、没有关键帧），接收端无法起播。
++     * 这里自己记账：首帧与每 interval 帧强制 IDR；并把 SPS/PPS 前缀拼进每帧码流。 */
++    long frames_since_idr;
++    int force_reopen;             /* 请求了 IDR 但驱动没给 → 下一帧重开会话兜底 */
++    long fixkey_frames;           /* FIXKEY 自己的帧计数（与 frame_idx 解耦，避免时序歧义） */
++    int sps_forced;               /* 拿到参数集后是否已强制过一次 IDR */
++    unsigned char *sps_pps;       /* 缓存的 SPS/PPS（Annex-B，含起始码） */
++    uint32_t sps_pps_len;
++    unsigned char *fixbuf;        /* FIXKEY 输出缓冲（参数集前缀 + 码流副本） */
++    uint32_t fix_cap;
++
+     /* SetCodecCallback 拿到的（原始回调，不是我们的转发壳） */
+     int have_cb;
+     void *cb_ctx, *cb0, *cb1;
++
++    /* 异步回调变体（QQ_NVENC_ASYNCCB=1）：
++     * 原实现是 DoEncode 返回之后由编码线程回调，且递下去的是它自己的 packet；
++     * 这里把回调推迟到下一次 our_encode 进入时补发（= 上一次 DoEncode 返回之后），
++     * 并给下游一个我们自己的影子 packet + 码流副本（NVENC 的输出缓冲在
++     * nvEncUnlockBitstream 之后不保证还有效，必须复制）。 */
++    int pend;                     /* 有一帧待补发 */
++    void *pend_shadow;            /* 影子 packet（跨调用有效） */
++    void *cb_copy;                /* 码流副本 */
++    uint32_t cb_cap;
+ };
++
++#define SHADOW_SIZE 0x80u         /* 与探针 hexdump 的 packet 长度一致 */
++
++/* 前置声明：our_uninit 里也要用来补发最后一帧 */
++static void async_flush(struct wrapped *w);
++static int async_prepare(struct wrapped *w, void *src_pkt, uint32_t idx, uint32_t qp,
++                         uint32_t sz, const void *data);
+ #define MAX_WRAPPED 8
+ static struct wrapped wrapped[MAX_WRAPPED];
+ static pthread_mutex_t wrap_lock = PTHREAD_MUTEX_INITIALIZER;
+@@ -293,6 +332,102 @@ static void hexdump(const char *tag, const void *p, size_t n)
+     }
+ }
+ 
++/* 码流首部分析：判断封装（Annex-B vs AVCC）、有没有 SPS/PPS、profile 档位。
++ * 只读、只在 QQ_NVENC_HEXDUMP=1 时调用。原实现的缓冲是复用的，
++ * 所以调用方必须【在回调里立刻】把指针交进来，不能延后。 */
++static void bs_analyze(const char *tag, const void *p, uint32_t n)
++{
++    const unsigned char *b = p;
++    char hex[3 * 16 + 1];
++    size_t j, k;
++    int annexb = 0, avcc = 0, sps = 0, pps = 0, idr = 0, nonidr = 0;
++    int profile = -1;
++
++    if (!p || n < 4)
++        return;
++    k = (n > 16) ? 16 : n;
++    for (j = 0; j < k; ++j)
++        sprintf(hex + 3 * j, "%02x ", b[j]);
++    hex[3 * k] = '\0';
++    LOG("%s 码流 len=%u 首 %zu 字节: %s", tag, n, k, hex);
++
++    /* 封装判定 */
++    if (b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 1)
++        annexb = 4;
++    else if (b[0] == 0 && b[1] == 0 && b[2] == 1)
++        annexb = 3;
++    else {
++        uint32_t v = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
++                     ((uint32_t)b[2] << 8) | (uint32_t)b[3];
++        if (v > 0 && v <= n)
++            avcc = 1;                       /* 4 字节大端长度前缀 = AVCC */
++    }
++
++    /* AVCC：按长度前缀走一遍，否则看不到 SPS/PPS（它们是长度前缀而不是起始码） */
++    if (avcc) {
++        uint32_t off = 0, lim2 = (n < 64) ? n : 64;
++        while (off + 4 <= lim2) {
++            uint32_t l = ((uint32_t)b[off] << 24) | ((uint32_t)b[off + 1] << 16) |
++                         ((uint32_t)b[off + 2] << 8) | (uint32_t)b[off + 3];
++            unsigned char nal;
++            if (!l || off + 4 + l > n)
++                break;
++            nal = b[off + 4] & 0x1f;
++            if (nal == 7) {
++                sps = 1;
++                if (profile < 0)
++                    profile = b[off + 5];
++            } else if (nal == 8) {
++                pps = 1;
++            } else if (nal == 5) {
++                idr = 1;
++            } else if (nal == 1) {
++                nonidr = 1;
++            }
++            off += 4 + l;
++        }
++    }
++
++    /* 扫前 64 字节里的 NAL（只做粗略识别，够判读用） */
++    if (!avcc) {
++        uint32_t lim = (n < 64) ? n : 64;
++        uint32_t i2;
++        for (i2 = 0; i2 + 4 < lim; ++i2) {
++            int sc = 0;
++            if (b[i2] == 0 && b[i2 + 1] == 0 && b[i2 + 2] == 0 && b[i2 + 3] == 1)
++                sc = 4;
++            else if (b[i2] == 0 && b[i2 + 1] == 0 && b[i2 + 2] == 1)
++                sc = 3;
++            if (!sc || i2 + sc >= lim)
++                continue;
++            {
++                unsigned char nal = b[i2 + sc] & 0x1f;
++                if (nal == 7) {
++                    sps = 1;
++                    if (i2 + sc + 1 < lim && profile < 0)
++                        profile = b[i2 + sc + 1];
++                } else if (nal == 8) {
++                    pps = 1;
++                } else if (nal == 5) {
++                    idr = 1;
++                } else if (nal == 1) {
++                    nonidr = 1;
++                }
++            }
++        }
++    }
++
++    LOG("%s 封装=%s%s SPS=%s PPS=%s IDR=%s 非IDR=%s profile=%s",
++        tag,
++        annexb == 4 ? "Annex-B(4字节起始码)" : annexb == 3 ? "Annex-B(3字节起始码)" : "",
++        avcc ? "AVCC(4字节长度前缀)" : "",
++        sps ? "有" : "无", pps ? "有" : "无",
++        idr ? "有" : "无", nonidr ? "有" : "无",
++        profile < 0 ? "?" : profile == 0x42 ? "0x42 Baseline"
++                   : profile == 0x4d ? "0x4D Main"
++                   : profile == 0x64 ? "0x64 High" : "其它");
++}
++
+ static struct wrapped *find_wrapped(void *self)
+ {
+     struct wrapped *w = NULL;
+@@ -320,6 +455,13 @@ static void nv_close(struct wrapped *w)
+     }
+     w->session = w->inbuf = w->outbuf = NULL;
+     w->nv_on = 0;
++    /* 变体自己的两块缓冲：有挂起帧时不能释放（补发还要用） */
++    if (!w->pend) {
++        free(w->cb_copy);
++        free(w->pend_shadow);
++        w->cb_copy = w->pend_shadow = NULL;
++        w->cb_cap = 0;
++    }
+ }
+ 
+ static int nv_open(struct wrapped *w, int wpx, int hpx, int fps, int kbps)
+@@ -376,6 +518,16 @@ static int nv_open(struct wrapped *w, int wpx, int hpx, int fps, int kbps)
+     cfg.encodeCodecConfig.h264Config.outputAUD = 1;
+     cfg.encodeCodecConfig.h264Config.level = NV_ENC_LEVEL_AUTOSELECT;
+ 
++    if (nv_baseline) {
++        /* QQ_NVENC_BASELINE=1：接收/转发链路可能只吃基线档 */
++        cfg.profileGUID = NV_ENC_H264_PROFILE_BASELINE_GUID;
++        cfg.encodeCodecConfig.h264Config.entropyCodingMode =
++            NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC;      /* Baseline 不允许 CABAC */
++        cfg.encodeCodecConfig.h264Config.outputAUD = 0;
++        memset(&cfg.encodeCodecConfig.h264Config.h264VUIParameters, 0,
++               sizeof cfg.encodeCodecConfig.h264Config.h264VUIParameters);
++    }
++
+     memset(&ip, 0, sizeof ip);
+     ip.version = NV_ENC_INITIALIZE_PARAMS_VER;
+     ip.encodeGUID = NV_ENC_CODEC_H264_GUID;
+@@ -426,12 +578,137 @@ static int nv_open(struct wrapped *w, int wpx, int hpx, int fps, int kbps)
+     w->fps = fps;
+     w->kbps = kbps;
+     w->frame_idx = 0;
++    w->frames_since_idr = 0;
++    w->fixkey_frames = 0;
++    w->sps_forced = 0;
+     w->nv_on = 1;
+-    LOG("NVENC: 会话就绪 %dx%d @%d, %d kbps CBR, idr=%d, 码流缓冲 %u 字节",
+-        wpx, hpx, fps, kbps, fps * 2, bb.size);
++    if (nv_fixkey) {
++        NV_ENC_SEQUENCE_PARAM_PAYLOAD sq;
++        unsigned char pbuf[1024];
++        uint32_t psz = (uint32_t)sizeof pbuf;
++
++        memset(&sq, 0, sizeof sq);
++        sq.version = NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER;
++        sq.spsppsBuffer = pbuf;
++        sq.inBufferSize = psz;
++        sq.outSPSPPSPayloadSize = &psz;
++        st = nvfl.nvEncGetSequenceParams(w->session, &sq);
++        free(w->sps_pps);
++        w->sps_pps = NULL;
++        w->sps_pps_len = 0;
++        if (st == NV_ENC_SUCCESS && psz > 0 && psz <= sizeof pbuf) {
++            w->sps_pps = (unsigned char *)malloc(psz);
++            if (w->sps_pps) {
++                memcpy(w->sps_pps, pbuf, psz);
++                w->sps_pps_len = psz;
++            }
++            LOG("NVENC: [FIXKEY] 已缓存 SPS/PPS %u 字节", psz);
++        } else {
++            LOG("NVENC: [FIXKEY] 初始化时取 SPS/PPS 失败 status=%d（正常：驱动多半要等第一帧；编码后会重试并从码流里抠）", (int)st);
++        }
++    }
++    LOG("NVENC: 会话就绪 %dx%d @%d, %d kbps CBR, idr=%d, 码流缓冲 %u 字节%s%s",
++        wpx, hpx, fps, kbps, fps * 2, bb.size,
++        nv_baseline ? ", profile=Baseline(强制)" : ", profile=preset 默认",
++        nv_hexdump ? ", HEXDUMP=开" : "");
++    if (nv_fixkey)
++        LOG("NVENC: [FIXKEY] 已启用：首帧与每 %d 帧强制 IDR，参数集 %u 字节%s",
++            nv_idr_interval, w->sps_pps_len,
++            nv_reopen_idr ? "，驱动不听就重开会话" : "");
+     return 0;
+ }
+ 
++/* FIXKEY：从一帧 Annex-B 码流里抠出 SPS(7)+PPS(8) 并缓存（含起始码）。
++ * 返回 1 = 本次成功缓存；0 = 这帧没有参数集 / 已有缓存 / 抠不出来。 */
++static int fixkey_grab_ps(struct wrapped *w, const unsigned char *bs, uint32_t len)
++{
++    uint32_t i = 0, ps_start = 0, ps_end = 0, sz;
++    int have_sps = 0, have_pps = 0;
++
++    if (w->sps_pps_len || !bs || len < 8)
++        return 0;
++    while (i + 4 <= len) {
++        uint32_t sc = 0, nal;
++        if (bs[i] == 0 && bs[i + 1] == 0 && bs[i + 2] == 1)
++            sc = 3;
++        else if (bs[i] == 0 && bs[i + 1] == 0 && bs[i + 2] == 0 && bs[i + 3] == 1)
++            sc = 4;
++        if (!sc) { i++; continue; }
++        nal = bs[i + sc] & 0x1f;
++        if (nal == 7 && !have_sps) { ps_start = i; have_sps = 1; i += sc; continue; }
++        if (nal == 8 && have_sps && !have_pps) { have_pps = 1; i += sc; continue; }
++        if (have_pps) { ps_end = i; break; }
++        i += sc;
++    }
++    if (have_pps && ps_end == 0)
++        ps_end = len;
++    if (!have_sps || !have_pps || ps_end <= ps_start)
++        return 0;
++    sz = ps_end - ps_start;
++    if (sz < 8 || sz > 4096)
++        return 0;
++    w->sps_pps = (unsigned char *)malloc(sz);
++    if (!w->sps_pps)
++        return 0;
++    memcpy(w->sps_pps, bs + ps_start, sz);
++    w->sps_pps_len = sz;
++    return 1;
++}
++
++/* FIXKEY：把 SPS/PPS 前缀 + 码流副本拼进我们自己的缓冲。
++ * 返回 0 成功：指针与长度改指向 w->fixbuf；-1 失败。 */
++static int fixkey_build(struct wrapped *w, const unsigned char *bs, uint32_t bs_len,
++                        void **ptr, uint32_t *sz)
++{
++    uint32_t i, pre, need;
++    int has_ps = 0;
++
++    /* 扫 Annex-B 起始码，看码流里是否已带参数集（4 字节或 3 字节起始码） */
++    for (i = 0; i + 3 < bs_len; ) {
++        if (bs[i] == 0 && bs[i + 1] == 0 && bs[i + 2] == 1) {
++            unsigned t = bs[i + 3] & 0x1f;
++            if (t == 7 || t == 8) {
++                has_ps = 1;
++                break;
++            }
++            i += 3;
++            continue;
++        }
++        i++;
++    }
++    pre = has_ps ? 0 : w->sps_pps_len;
++    need = pre + bs_len;
++    if (need > w->fix_cap) {
++        unsigned char *nb = (unsigned char *)realloc(w->fixbuf, need + 1024);
++        if (!nb)
++            return -1;
++        w->fixbuf = nb;
++        w->fix_cap = need + 1024;
++    }
++    if (pre)
++        memcpy(w->fixbuf, w->sps_pps, pre);
++    memcpy(w->fixbuf + pre, bs, bs_len);
++    *ptr = w->fixbuf;
++    *sz = need;
++    return 0;
++}
++
++/* 几何修正（QQ_NVENC_GEOM_FIX=1 才生效，默认关 = 原行为）：
++ * 某些编码器对象的 VideoFrame 头里 (w,h) 读出来是竖的，但 Y 行距 ypitch 表明缓冲
++ * 其实是横的（ypitch == h 且 ypitch != w）。行距不会骗人 —— 此时把宽高换回来。 */
++static void geom_fix(uint32_t *pw, uint32_t *ph, uint32_t ypitch)
++{
++    uint32_t t;
++    if (!flag_on("QQ_NVENC_GEOM_FIX", 0))
++        return;
++    if (*pw && *ph && ypitch && ypitch == *ph && ypitch != *pw) {
++        uint32_t ow = *pw, oh = *ph;
++        t = *pw; *pw = *ph; *ph = t;
++        LOG("NVENC: [GEOM] 行距表明宽高读反：帧头 %ux%u ypitch=%u -> 会话按 %ux%u 开",
++            ow, oh, ypitch, *pw, *ph);
++    }
++}
++
+ /* 把 VideoFrame(I420) 拷进 NVENC 输入缓冲，编码一帧，返回码流。
+  * 成功时 sz/ptr/qp 有效；失败返回 -1（调用方回落原实现）。 */
+ static int nv_encode(struct wrapped *w, VideoFrame *f, uint32_t *sz, void **ptr,
+@@ -453,10 +730,19 @@ static int nv_encode(struct wrapped *w, VideoFrame *f, uint32_t *sz, void **ptr,
+     py = getptr((char *)f + VF_OFF_Y);
+     pu = getptr((char *)f + VF_OFF_U);
+     pv = getptr((char *)f + VF_OFF_V);
++    geom_fix(&wpx, &hpx, ypitch);
+     if (py && pu && pv && (!wpx || !hpx || wpx > 8192 || hpx > 8192))
+         return -1;                                /* 尺寸离谱，宁可回落 */
+     if (!py || !pu || !pv || !wpx || !hpx)
+         return -1;
++    if (nv_fixkey && w->force_reopen) {
++        w->force_reopen = 0;
++        LOG("NVENC: [FIXKEY] 驱动未按请求给 IDR —— 重开会话强制出关键帧");
++        if (nv_open(w, (int)wpx, (int)hpx, w->fps, w->kbps) != 0) {
++            w->nv_dead = 1;
++            return -1;
++        }
++    }
+     if (!ypitch)
+         ypitch = wpx;
+     if (!uvpitch)
+@@ -469,8 +755,10 @@ static int nv_encode(struct wrapped *w, VideoFrame *f, uint32_t *sz, void **ptr,
+             return -1;
+     }
+     if (w->encode_calls <= 3)
+-        LOG("NVENC: 开始编码 %ux%u ypitch=%u uvpitch=%u 平面=%p/%p/%p",
+-            wpx, hpx, ypitch, uvpitch, (void *)py, (void *)pu, (void *)pv);
++        LOG("NVENC: 开始编码 obj=%p 第%u帧 会话=%dx%d 帧头=%ux%u ypitch=%u uvpitch=%u",
++            (void *)w, w->encode_calls, w->w, w->h,
++            get32((char *)f + VF_OFF_W), get32((char *)f + VF_OFF_H),
++            ypitch, uvpitch);
+ 
+     memset(&lib, 0, sizeof lib);
+     lib.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
+@@ -505,7 +793,14 @@ static int nv_encode(struct wrapped *w, VideoFrame *f, uint32_t *sz, void **ptr,
+     pp.bufferFmt = NV_ENC_BUFFER_FORMAT_IYUV;
+     pp.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
+     pp.encodePicFlags = NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
+-    if (w->force_idr || w->frame_idx == 0) {
++    if (nv_fixkey) {
++        /* 用 fixkey_frames（本对象自己的计数）判首帧 —— frame_idx 在 our_encode
++         * 的成功分支里才自增，跨对象/跨路径看容易误判。 */
++        if (w->fixkey_frames == 0 || w->force_idr ||
++            (nv_idr_interval > 0 && w->frames_since_idr >= nv_idr_interval))
++            pp.encodePicFlags |= NV_ENC_PIC_FLAG_FORCEIDR;
++        w->force_idr = 0;
++    } else if (w->force_idr || w->frame_idx == 0) {
+         pp.encodePicFlags |= NV_ENC_PIC_FLAG_FORCEIDR;
+         w->force_idr = 0;
+     }
+@@ -525,9 +820,74 @@ static int nv_encode(struct wrapped *w, VideoFrame *f, uint32_t *sz, void **ptr,
+     *ptr = lb.bitstreamBufferPtr;
+     *qp = lb.frameAvgQP;
+     *is_idr = (lb.pictureType == NV_ENC_PIC_TYPE_IDR);
++    /* 我们自己的码流只在锁住期间有效 —— 必须在 Unlock 之前分析 */
++    if (nv_hexdump && w->encode_calls < 8 && *ptr && *sz)
++        bs_analyze("  [NVENC]", *ptr, *sz);
++    if (nv_fixkey && *ptr && *sz) {
++        /* 还没有参数集：先试着从这一帧里抠（驱动开了 OUTPUT_SPSPPS 时 IDR 帧会带），
++         * 抠不到再问一次 nvEncGetSequenceParams（初始化时问多半是空的）。 */
++        if (!w->sps_pps_len) {
++            if (fixkey_grab_ps(w, *ptr, *sz) && w->sps_pps_len) {
++                LOG("NVENC: [FIXKEY] 从码流抠到 SPS/PPS %u 字节 → 下一帧强制 IDR，让接收端拿到完整起点",
++                    w->sps_pps_len);
++                w->force_idr = 1;
++            } else if (nvfl.nvEncGetSequenceParams) {
++                NV_ENC_SEQUENCE_PARAM_PAYLOAD sq;
++                unsigned char pbuf[1024];
++                uint32_t psz = (uint32_t)sizeof pbuf;
++                NVENCSTATUS s2;
++
++                memset(&sq, 0, sizeof sq);
++                sq.version = NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER;
++                sq.spsppsBuffer = pbuf;
++                sq.inBufferSize = psz;
++                sq.outSPSPPSPayloadSize = &psz;
++                s2 = nvfl.nvEncGetSequenceParams(w->session, &sq);
++                if (s2 == NV_ENC_SUCCESS && psz > 0 && psz <= sizeof pbuf) {
++                    w->sps_pps = (unsigned char *)malloc(psz);
++                    if (w->sps_pps) {
++                        memcpy(w->sps_pps, pbuf, psz);
++                        w->sps_pps_len = psz;
++                        LOG("NVENC: [FIXKEY] 编码后取到 SPS/PPS %u 字节 → 下一帧强制 IDR",
++                            w->sps_pps_len);
++                        w->force_idr = 1;
++                    }
++                } else if (w->fixkey_frames < 3) {
++                    LOG("NVENC: [FIXKEY] 编码后仍取不到 SPS/PPS status=%d（out=%u 字节）",
++                        (int)s2, psz);
++                }
++            }
++        }
++        /* 码流缓冲归驱动所有、Unlock 之后失效，必须复制；
++         * 同时补上参数集，保证任何一帧都能独立起播。 */
++        if (fixkey_build(w, *ptr, *sz, ptr, sz) != 0) {
++            nvfl.nvEncUnlockBitstream(w->session, w->outbuf);
++            return -1;
++        }
++    }
+     nvfl.nvEncUnlockBitstream(w->session, w->outbuf);
+     if (w->encode_calls <= 3)
+         LOG("NVENC: 出流 %u 字节 qp=%u type=%d", *sz, *qp, (int)lb.pictureType);
++    if (nv_fixkey) {
++        w->fixkey_frames++;
++        if (*is_idr) {
++            w->frames_since_idr = 0;
++            if (w->sps_pps_len)
++                w->sps_forced = 1;
++        } else {
++            w->frames_since_idr++;
++        }
++        if (nv_reopen_idr && !*is_idr &&
++            (pp.encodePicFlags & NV_ENC_PIC_FLAG_FORCEIDR))
++            w->force_reopen = 1;
++        /* 诊断：前 3 帧 + 每次请求 IDR 的帧都打（不再受 encode_calls<8 限制，
++         * 免得 tail 一截就把首帧那行漏掉） */
++        if (nv_hexdump &&
++            (w->fixkey_frames <= 3 || (pp.encodePicFlags & NV_ENC_PIC_FLAG_FORCEIDR)))
++            LOG("NVENC: [FIXKEY] obj=%p 第%ld帧 idx=%ld req_flags=0x%x pictureType=%d is_idr=%d 距上次IDR=%ld 参数集=%u",
++                (void *)w, w->fixkey_frames, w->frame_idx, (unsigned)pp.encodePicFlags,
++                (int)lb.pictureType, *is_idr, w->frames_since_idr, w->sps_pps_len);
++    }
+     return (*sz && *ptr) ? 0 : -1;
+ }
+ 
+@@ -576,10 +936,61 @@ static int our_uninit(void *self)
+     if (!w)
+         return -1;
+     orig = (uninit_fn)w->orig_vtable[VT_OFF_UNINIT];
++    async_flush(w);           /* 收尾：别把最后一帧丢掉 */
+     nv_close(w);
+     return orig(self);
+ }
+ 
++/* ---------- 异步回调变体（QQ_NVENC_ASYNCCB=1） ---------- */
++
++/* 补发上一帧的回调 —— 必须在「上一次 DoEncode 已经返回」之后调用 */
++static void async_flush(struct wrapped *w)
++{
++    void *pk;
++
++    if (!w->pend)
++        return;
++    w->pend = 0;
++    if (!w->have_cb || !w->pend_shadow) {
++        LOG("NVENC: [ASYNCCB] 有挂起帧但没有回调或影子 packet，丢弃");
++        return;
++    }
++    pk = w->pend_shadow;
++    LOG("NVENC: [ASYNCCB] 补发上一帧回调 idx=%u len=%u",
++        get32((char *)pk + PKT_OFF_IDX), get32((char *)pk + PKT_OFF_LEN));
++    ((pkt_cb_fn)w->cb0)(w->cb_ctx, &pk, w->cb1);
++    LOG("NVENC: [ASYNCCB] 补发回调已返回");
++}
++
++/* 把这一帧的码流复制下来、装进影子 packet，等下一次进入时补发 */
++static int async_prepare(struct wrapped *w, void *src_pkt, uint32_t idx, uint32_t qp,
++                         uint32_t sz, const void *data)
++{
++    if (!w->pend_shadow) {
++        w->pend_shadow = calloc(1, SHADOW_SIZE);
++        if (!w->pend_shadow)
++            return -1;
++    }
++    if (w->cb_cap < sz) {
++        void *n = realloc(w->cb_copy, sz);
++
++        if (!n)
++            return -1;
++        w->cb_copy = n;
++        w->cb_cap = sz;
++    }
++    memcpy(w->cb_copy, data, sz);
++    /* 影子 packet：先照抄调用方那份（保留它填过的其它字段），再写我们这四个 */
++    if (src_pkt)
++        memcpy(w->pend_shadow, src_pkt, SHADOW_SIZE);
++    put32((char *)w->pend_shadow + PKT_OFF_IDX, idx);
++    put32((char *)w->pend_shadow + PKT_OFF_QP, qp);
++    put32((char *)w->pend_shadow + PKT_OFF_LEN, sz);
++    put64((char *)w->pend_shadow + PKT_OFF_DATA, w->cb_copy);
++    w->pend = 1;
++    return 0;
++}
++
+ static int our_encode(void *self, VideoFrame *frame, VideoPacket *packet, void *user)
+ {
+     struct wrapped *w = find_wrapped(self);
+@@ -589,6 +1000,9 @@ static int our_encode(void *self, VideoFrame *frame, VideoPacket *packet, void *
+         return -1;
+     orig = (encode_fn)w->orig_vtable[VT_OFF_ENCODE];
+ 
++    /* 上一次 DoEncode 已经返回，此刻才补发它的回调（异步变体） */
++    async_flush(w);
++
+     /* 记录（只在采样窗口内） */
+     if (w->encode_calls < 3) {
+         LOG("DoEncode(self=%p frame=%p packet=%p user=%p) 第 %d 次【前】宽=%u 高=%u",
+@@ -617,10 +1031,24 @@ static int our_encode(void *self, VideoFrame *frame, VideoPacket *packet, void *
+             if (w->encode_calls <= 4)
+                 LOG("NVENC 出帧 idx=%lld %s %u 字节 qp=%u -> 回调 ctx=%p cb=%p",
+                     idx, is_idr ? "IDR" : "P", sz, qp, w->cb_ctx, w->cb0);
+-            ((pkt_cb_fn)w->cb0)(w->cb_ctx, &pk, w->cb1);
+-            if (w->encode_calls <= 4)
+-                LOG("NVENC: 回调已返回");
+-            return 0;
++            if (nv_async_cb) {
++                /* 不在这里回调：装进影子 packet，等下一次进入 our_encode 时补发 */
++                if (async_prepare(w, packet, (uint32_t)idx, qp, sz, data) != 0) {
++                    LOG("NVENC: [ASYNCCB] 影子 packet/码流副本分配失败，本帧回落原实现");
++                    w->nv_dead = 1;
++                    nv_close(w);
++                } else {
++                    if (w->encode_calls <= 4)
++                        LOG("NVENC: [ASYNCCB] 延迟回调 idx=%lld %u 字节 qp=%u（本次 DoEncode 直接返回，下次进入时补发）",
++                            idx, sz, qp);
++                    return 0;
++                }
++            } else {
++                ((pkt_cb_fn)w->cb0)(w->cb_ctx, &pk, w->cb1);
++                if (w->encode_calls <= 4)
++                    LOG("NVENC: 回调已返回");
++                return 0;
++            }
+         }
+         LOG("NVENC: 本帧失败，之后回落原实现");
+         w->nv_dead = 1;
+@@ -654,7 +1082,7 @@ static void cb_tramp(void *ctx, void **pp_packet, void *user)
+ {
+     (void)user;
+     g_cb_ctx_seen = ctx;
+-    if (g_cb_calls < 3) {
++    if (g_cb_calls < 8) {
+         void *pk = pp_packet ? *pp_packet : NULL;
+         LOG("原实现回调第 %d 次: ctx=%p *pp_packet=%p", g_cb_calls + 1, ctx, pk);
+         if (pk && probe_dump) {
+@@ -662,8 +1090,12 @@ static void cb_tramp(void *ctx, void **pp_packet, void *user)
+             void *d = getptr((char *)pk + PKT_OFF_DATA);
+             uint32_t n = get32((char *)pk + PKT_OFF_LEN);
+             LOG("  -> data=%p len=%u idx=%u", d, n, get32((char *)pk + PKT_OFF_IDX));
+-            if (d && n > 0 && n < (1u << 22))
++            if (d && n > 0 && n < (1u << 22)) {
+                 hexdump("  bitstream[0..0x20]", d, 0x20);
++                /* 原实现的缓冲是复用的 —— 必须在回调里【立刻】分析，延后就没意义 */
++                if (nv_hexdump && g_cb_calls < 8)
++                    bs_analyze("  [原实现]", d, n);
++            }
+         }
+     }
+     g_cb_calls++;
+@@ -872,10 +1304,24 @@ static void qq_nvenc_init(void)
+         return;
+     probe_dump = flag_on("QQ_NVENC_PROBE_DUMP", 1);
+     nv_active = flag_on("QQ_NVENC_ACTIVE", 0);
++    nv_async_cb = flag_on("QQ_NVENC_ASYNCCB", 0);
++    nv_hexdump = flag_on("QQ_NVENC_HEXDUMP", 0);
++    nv_baseline = flag_on("QQ_NVENC_BASELINE", 0);
++    nv_fixkey = flag_on("QQ_NVENC_FIXKEY", 0);
++    nv_reopen_idr = flag_on("QQ_NVENC_REOPEN_IDR", 1);   /* 默认开：驱动忽略 FORCEIDR 时重开会话 */
++    {
++        const char *iv = getenv("QQ_NVENC_IDR_INTERVAL");
++        if (iv && *iv) {
++            int v = atoi(iv);
++            if (v >= 0)
++                nv_idr_interval = v;
++        }
++    }
+     if (!is_ppapi_process())
+         return;
+ 
+-    LOG("ppapi 进程，等待 AVSDK 加载（QQ_NVENC=1, ACTIVE=%d）", nv_active);
++    LOG("ppapi 进程，等待 AVSDK 加载（QQ_NVENC=1, ACTIVE=%d, ASYNCCB=%d, FIXKEY=%d）",
++        nv_active, nv_async_cb, nv_fixkey);
+     if (pthread_create(&th, NULL, hook_thread, NULL) == 0)
+         pthread_detach(th);
+ }
