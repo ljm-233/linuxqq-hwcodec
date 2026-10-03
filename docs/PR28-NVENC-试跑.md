@@ -54,6 +54,41 @@ LD_PRELOAD=$HOME/coding/linuxqq-hwcodec/libqq-nvenc.so QQ_NVENC=1 linuxqq-waylan
 | `QQ_NVENC_ACTIVE=1` | 配合上面：**真正用 NVENC 编码** |
 | `QQ_NVENC_PROBE_DUMP=0` | 只挂钩不打字节（排查用） |
 
+## 看不到日志 / 看起来没生效：先跑这个
+
+**实测踩到的第一个坑（2026-10-03）：只设 `QQ_NVENC_ACTIVE=1` 是完全静默的。**
+
+源码里的总开关是 `QQ_NVENC`（`src/qq-nvenc.c` 的构造函数）：
+
+```c
+if (!flag_on("QQ_NVENC", 0))
+    return;                       /* 没设总开关 → 直接返回：不挂钩、不打日志、不加载 NVENC */
+nv_active = flag_on("QQ_NVENC_ACTIVE", 0);   /* ACTIVE 只决定"要不要真接管" */
+```
+
+所以 `LD_PRELOAD=… QQ_NVENC_ACTIVE=1 …` 的现象是：**库确实被加载了（`/proc/PID/maps` 里有 `libqq-nvenc`），但一条日志都没有、`libnvidia-encode` 也没加载** —— 看起来像"没生效"，其实是从没开始 ✗
+
+一条命令看结论：
+
+```bash
+./nvenc-status.sh          # 只读；会报总开关、库映射、日志行，并给出结论
+```
+
+它按这个顺序判断：
+
+| 现象 | 含义 |
+|---|---|
+| `libqq-nvenc=0 段` | LD_PRELOAD 没生效（QQ 不是用带 LD_PRELOAD 的命令启动的） |
+| 库在、**`QQ_NVENC` 未设** | **总开关没开，构造函数直接 return** —— 补上 `QQ_NVENC=1` 并重启 QQ |
+| 总开关在、`libnvidia-encode=0 段` | 多半是**此刻没有在共享**（编码器对象是共享开始才创建） |
+| `libnvidia-encode` 已加载 | NVENC 真在跑 ✓ |
+
+另外两条容易误判的：
+
+- **环境变量只在进程启动时读一次** → 改完必须**完全退出 QQ** 再启动（QQ 是单实例，不退出新实例不接管）
+- **启动器每次启动都会截断日志**（`> $LOG`）→ 日志里只有**当前这次会话**的内容，看不到上一次的行是正常的
+
+
 ## 测试三步（**必须按顺序**）
 
 ### 第 1 步：旁观模式（只验证挂钩，不改行为）
