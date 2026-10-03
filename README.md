@@ -118,17 +118,35 @@ broadcast-core、有没有走 DllGetClassObject"在日志里永远看不到（20
 - 汇总里新增 **`--- 本进程 dlopen 过的库（N 个）---`**：库名去重列表，这样"谁在什么时候
   加载了 broadcast-core"一眼可见（之前只记次数，名字全丢）
 
-## 故意不包 `dlvsym`
+## `dlvsym` 必须包，但只能纯透传
 
-试过包 `dlvsym`（想让"调用方用版本化查找取符号"那条路也能被介入），**结果是破坏性的**：
-glibc 自己会用它做版本探测，而我们的包装在解析不到真实实现时返回 `nil`：
+**为什么必须包**：QQ 的调用方是 `dlopen("broadcast-core.so")` 之后用
+`dlvsym(handle, "DllGetClassObject", "VERS_1.0")` 取入口的 —— 符号本身带版本
+（`nm -D` 显示 `DllGetClassObject@@VERS_1.0`），所以日志里 `dlsym` 一直是 0。
+**只包 `dlsym` 会把整条路漏掉。**
 
-```
-dlvsym(0xffff...ffff, "dlopen", "GLIBC_2.34") -> (nil) [没找到]
-```
+**第一版为什么翻车**：当时"解析不到真实实现就返回 `nil`"，而 glibc 自己也会用 `dlvsym`
+做版本探测 —— `dlvsym(RTLD_DEFAULT, "dlopen", "GLIBC_2.34")` 变 `nil`，动态加载链整体退化
+（`run-test.sh` 段 D 当场失败）。现在的规矩：
 
-动态加载链整体退化（`test/run-test.sh` 段 D 当场失败）。**结论：`dlvsym` 属于 glibc 内部机制，
-不碰**；目标符号靠"导出同名符号"那条路介入。
+1. 只对三个目标名字做拦截，其余**原样透传**（含 `version == NULL` 的调用）
+2. 真实实现优先 `real_dlsym(RTLD_NEXT, "dlvsym")`，取不到就**扫 ELF 动态符号表**
+   （`dl_iterate_phdr`，不经过任何 PLT）；再取不到才退化成不带版本的 `dlsym`
+   —— **绝不无缘无故返回 `nil`**
+3. 引导必须扫 ELF：我们一旦导出 `dlvsym`，连自己文件里的 `dlvsym(...)` 调用也会被
+   动态链接器解析回我们自己，而"真实的 dlvsym"没法再用 dlsym/dlvsym 取（鸡生蛋）。
+   注意现代 glibc 的 `libc.so.6` **只有 `DT_GNU_HASH`、没有 `DT_HASH`** —— 只认后者会
+   直接扫不到（实测踩过）
+
+**还有一个只有包了才会遇到的坑**：包上之后，**我们自己**的符号解析
+（`hwprobe_lookup_real` / `next_definition` 里的 `dlvsym(...)`）也会落进我们的包装，
+如果目标名字恰好是 `DllGetClassObject`，`route_special` 会把它当成"调用方来取符号"，
+把 `cls_handle` 覆盖成 `RTLD_NEXT` —— 真实实现再也找不到，A/B/C 三段测试同时挂掉。
+修法是内部解析走 `internal_lookup` 标志短路：**纯转发、不计数、不路由**。
+
+回归测试：`test/dlvdriver.c` 复现真实取法（`dlvsym` + 版本号），`run-test.sh` 的 E 段断言
+"拦截生效 + 工厂照样被代理 + **glibc 自己的版本化查找没被弄坏**"，F 段再做 `ldd` /
+`python3 -c import ctypes` 等冒烟。
 
 ## 一个被数据推翻的推断（别再去主进程钩）
 

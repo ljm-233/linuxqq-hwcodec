@@ -1,0 +1,9 @@
+/* 让假模块的入口带版本号：DllGetClassObject@@VERS_1.0
+   真实 broadcast-core.so 就是这样（nm -D 显示 DllGetClassObject@@VERS_1.0），
+   而调用方用 dlvsym(handle, "DllGetClassObject", "VERS_1.0") 取它。 */
+VERS_1.0 {
+	global:
+		DllGetClassObject;
+	local:
+		*;
+};

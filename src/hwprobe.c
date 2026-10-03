@@ -27,6 +27,8 @@
 #include <signal.h>
 #include <time.h>
 #include <stdint.h>
+#include <link.h>      /* dl_iterate_phdr：dlvsym 引导用（不依赖任何被包装的函数） */
+#include <elf.h>
 
 #include "hwprobe.h"
 
@@ -53,6 +55,16 @@ static void *(*real_dlopen)(const char *, int);
 static void *(*real_dlmopen)(long, const char *, int);
 static void *(*real_dlsym)(void *, const char *);
 static char *(*real_dlerror)(void);
+static void *(*real_dlvsym)(void *, const char *, const char *);
+static int in_dlvsym;                 /* dlvsym 包装的重入保护 */
+/* 我们**自己**解析符号时置位：这类调用绝不能走 route_special。
+   2026-10-03：包装 dlvsym 后，hwprobe_lookup_real/next_definition 里的 dlvsym(...) 会
+   落进我们自己的包装 —— 目标名字恰好是 DllGetClassObject 时，route_special 会把它当成
+   "调用方来取符号"，把 cls_handle 覆盖成 RTLD_NEXT，真实实现再也找不到（测试 A/B/C 全挂）。 */
+static int internal_lookup;
+static int dlvsym_fallback_logged;    /* "真实 dlvsym 取不到，退化成 dlsym"只记一次 */
+static unsigned long n_dlvsym;        /* 走 dlvsym 路径的调用次数 */
+static int path_dlvsym_logged;        /* 目标符号经 dlvsym 被取走，只记一次 */
 
 /* 给 vthook.c 的访问器（日志 fd 与"未被包装"的真实函数） */
 int hwprobe_logfd(void)
@@ -142,6 +154,17 @@ void hwprobe_plog(const char *fmt, ...)
     }
 }
 
+/* 我们自己的符号解析：置 internal_lookup，避免被自己的 dlvsym 包装误当成"调用方取符号" */
+static void *internal_dlvsym(void *handle, const char *name, const char *version)
+{
+    void *p;
+
+    internal_lookup = 1;
+    p = real_dlvsym ? real_dlvsym(handle, name, version) : dlvsym(handle, name, version);
+    internal_lookup = 0;
+    return p;
+}
+
 /* 用没有被包装的 dlvsym 取真实函数，避免递归进我们自己的 dlsym */
 void *hwprobe_lookup_real(const char *name)
 {
@@ -158,8 +181,11 @@ void *hwprobe_lookup_real(const char *name)
     if (in_boot)
         return NULL;
     in_boot = 1;
-    for (i = 0; vers[i] && !p; i++)
-        p = dlvsym(RTLD_NEXT, name, vers[i]);
+    for (i = 0; vers[i] && !p; i++) {
+        /* real_dlvsym 已解析出来就直接用它 —— 否则裸写 dlvsym(...) 会绑到我们自己的
+         * 包装上（我们自己导出了它），多绕一圈（虽然包装里也有引导兜底）。 */
+        p = internal_dlvsym(RTLD_NEXT, name, vers[i]);
+    }
     /* 下面这两步以前写成 dlvsym(..., NULL)：glibc 把 version 标成 nonnull，
      * 传 NULL 是未定义行为 —— 实测在无版本符号（假 COM 模块）上直接段错误。
      * 改成用真正的 dlsym；real_dlsym 还没解析出来时（正是本函数在干的事）就跳过。 */
@@ -273,7 +299,7 @@ static void *next_definition(const char *name, void *self)
     int i;
 
     for (i = 0; vers[i] && !p; i++)
-        p = dlvsym(RTLD_NEXT, name, vers[i]);
+        p = internal_dlvsym(RTLD_NEXT, name, vers[i]);
     /* 无版本符号（例如测试用的假 COM 模块）只能用 dlsym；
      * 绝不能写 dlvsym(..., NULL) —— glibc 标了 nonnull，实测直接段错误。 */
     if (!p && real_dlsym)
@@ -441,13 +467,160 @@ void *dlsym(void *handle, const char *name)
 }
 
 /*
- * 关于 dlvsym：**故意不包**。
- * 2026-10-03 试过包它（想让"调用方用 dlvsym 取版本化符号"那条路也能被介入），
- * 结果 glibc 自己会用它做版本探测：
- *     dlvsym(0xffff...ffff, "dlopen", "GLIBC_2.34") -> (nil)
- * 我们解析不到真实实现时返回 nil，动态加载链整体退化（test/run-test.sh 段 D 当场挂）。
- * 结论：dlvsym 属于 glibc 内部机制，不碰；目标符号靠"导出同名符号"那条路介入。
+ * 关于 dlvsym：**必须包，但只能纯透传**。
+ *
+ * 为什么必须包：QQ 的调用方是 `dlopen("broadcast-core.so")` 之后用
+ * `dlvsym(handle, "DllGetClassObject", "VERS_1.0")` 取入口的（符号本身带版本），
+ * 所以 dlsym 计数一直是 0 —— 只包 dlsym 会把整条路漏掉。
+ *
+ * 第一版为什么翻车：实现里"解析不到真实实现就返回 NULL"，而 glibc 自己会用
+ * dlvsym 做版本探测（实测 `dlvsym(RTLD_DEFAULT, "dlopen", "GLIBC_2.34")` 返回 nil），
+ * 于是动态加载链整体退化（run-test.sh 段 D 当场挂）。现在的规矩是：
+ *   1) 只对三个目标名字做拦截，其余**原样透传**（含 version == NULL 的调用）
+ *   2) 真实实现优先用 real_dlsym(RTLD_NEXT, "dlvsym") 取；取不到就扫 ELF 动态符号表
+ *   3) 再取不到才退化成不带版本的 dlsym —— **绝不无缘无故返回 NULL**
+ *
+ * 引导为什么要扫 ELF：我们一旦导出 dlvsym，连自己文件里的 `dlvsym(...)` 调用也会
+ * 被动态链接器解析回我们自己，而"真实的 dlvsym"没法再用 dlsym/dlvsym 去取（鸡生蛋）。
+ * dl_iterate_phdr 不经过任何 PLT，正好用来打破这个循环。
  */
+struct boot_scan {
+    const char *want;
+    void *found;
+};
+
+static int boot_scan_cb(struct dl_phdr_info *info, size_t size, void *data)
+{
+    struct boot_scan *s = data;
+    const ElfW(Dyn) *dyn = NULL;
+    const ElfW(Sym) *symtab = NULL;
+    const char *strtab = NULL;
+    const uint32_t *gnu_hash = NULL;
+    size_t nsym = 0, k;
+    unsigned i;
+
+    (void)size;
+    if (s->found)
+        return 1;
+    /* 只认 libc：dlvsym 在那里；也顺带避开我们自己（我们也导出同名符号） */
+    if (!info->dlpi_name || !strstr(info->dlpi_name, "libc.so"))
+        return 0;
+    for (i = 0; i < info->dlpi_phnum; i++)
+        if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
+            dyn = (const ElfW(Dyn) *)(uintptr_t)(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+            break;
+        }
+    if (!dyn)
+        return 0;
+    for (; dyn->d_tag != DT_NULL; dyn++) {
+        switch (dyn->d_tag) {
+        case DT_SYMTAB: symtab = (const ElfW(Sym) *)(uintptr_t)dyn->d_un.d_ptr; break;
+        case DT_STRTAB: strtab = (const char *)(uintptr_t)dyn->d_un.d_ptr; break;
+        case DT_HASH:   nsym = ((const uint32_t *)(uintptr_t)dyn->d_un.d_ptr)[1]; break;
+        case DT_GNU_HASH: gnu_hash = (const uint32_t *)(uintptr_t)dyn->d_un.d_ptr; break;
+        default: break;
+        }
+    }
+    /* 现代 glibc 的 libc.so.6 只有 DT_GNU_HASH，没有 DT_HASH（实测 nchain 取不到）——
+       靠它算符号总数：遍历每个桶，走到链尾（最低位为 1）就得到该桶最后一个符号的下标。 */
+    if (!nsym && gnu_hash) {
+        const uint32_t nbuckets = gnu_hash[0];
+        const uint32_t symoffset = gnu_hash[1];
+        const uint32_t bloom_size = gnu_hash[2];
+        const uint32_t *buckets = gnu_hash + 4 + bloom_size * 2; /* bloom 是 64 位，占 2 个 u32 */
+        const uint32_t *chain = buckets + nbuckets;
+        uint32_t b, maxidx = 0;
+
+        for (b = 0; b < nbuckets; b++) {
+            uint32_t idx = buckets[b];
+            uint32_t j, last;
+
+            if (idx < symoffset)
+                continue;
+            last = idx;
+            j = idx - symoffset;
+            while (!(chain[j] & 1u)) {
+                j++;
+                last++;
+            }
+            if (last + 1 > maxidx)
+                maxidx = last + 1;
+        }
+        nsym = maxidx;
+    }
+    if (!symtab || !strtab || !nsym)
+        return 0;
+    for (k = 0; k < nsym; k++) {
+        if (symtab[k].st_shndx == SHN_UNDEF || symtab[k].st_name == 0)
+            continue;
+        if (strcmp(strtab + symtab[k].st_name, s->want) == 0) {
+            s->found = (void *)(uintptr_t)(info->dlpi_addr + symtab[k].st_value);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void *elf_bootstrap_lookup(const char *want)
+{
+    struct boot_scan s;
+
+    s.want = want;
+    s.found = NULL;
+    dl_iterate_phdr(boot_scan_cb, &s);
+    return s.found;
+}
+
+HWPROBE_EXPORT void *dlvsym(void *handle, const char *name, const char *version)
+{
+    void *r;
+
+    /* 引导：优先问真实 dlsym，其次扫 ELF（两条路都不经过被包装的 dlvsym） */
+    if (!real_dlvsym) {
+        if (real_dlsym)
+            real_dlvsym = real_dlsym(RTLD_NEXT, "dlvsym");
+        if (!real_dlvsym)
+            real_dlvsym = elf_bootstrap_lookup("dlvsym");
+    }
+    /* 内部解析：纯转发，不计数、不路由、不记日志 */
+    if (internal_lookup)
+        return real_dlvsym ? real_dlvsym(handle, name, version)
+                           : (real_dlsym ? real_dlsym(handle, name) : NULL);
+
+    n_dlvsym++;
+    maybe_periodic_summary();
+
+    if (in_dlvsym) {
+        /* 重入（真实 dlvsym 内部又调到我们）：直接用真实实现，避免自锁 */
+        return real_dlvsym ? real_dlvsym(handle, name, version) : NULL;
+    }
+    in_dlvsym = 1;
+    if (route_special(handle, name, &r)) {
+        if (!path_dlvsym_logged && name && strcmp(name, "DllGetClassObject") == 0) {
+            path_dlvsym_logged = 1;
+            hwprobe_plog("符号介入路径：DllGetClassObject 是调用方用 "
+                         "dlvsym(handle, \"%s\", \"%s\") 取走的",
+                         name, version ? version : "(null)");
+        }
+    } else if (real_dlvsym) {
+        r = real_dlvsym(handle, name, version);
+    } else if (real_dlsym) {
+        /* 彻底取不到真实 dlvsym 时，退化到"不解释版本"的 dlsym —— 绝不返回 nil */
+        r = real_dlsym(handle, name);
+        if (!dlvsym_fallback_logged) {
+            dlvsym_fallback_logged = 1;
+            hwprobe_plog("dlvsym 真实实现取不到，已退化为不带版本的 dlsym（不影响调用方）");
+        }
+    } else {
+        r = NULL;
+    }
+    in_dlvsym = 0;
+
+    if (interesting_sym(name))
+        hwprobe_plog("dlvsym(%p, \"%s\", \"%s\") -> %p%s", handle, name ? name : "(null)",
+                     version ? version : "(null)", r, r ? "" : " [没找到]");
+    return r;
+}
 
 /* ---------- 被包装的目标符号 ---------- */
 
@@ -527,6 +700,16 @@ HWPROBE_EXPORT void *DllGetClassObject(const void *clsid, const void *iid, void 
         guid_str(clsid, cs, sizeof cs);
     if (iid)
         guid_str(iid, is, sizeof is);
+    /* 记下真实实现来自哪个模块：解析错库时（同名符号是通用名字）这条一眼看得出来 */
+    if (fn) {
+        Dl_info di;
+
+        if (dladdr((void *)fn, &di) && di.dli_fname)
+            hwprobe_plog("DllGetClassObject 真实实现 = %s+0x%lx", base(di.dli_fname),
+                         (unsigned long)((const char *)fn - (const char *)di.dli_fbase));
+        else
+            hwprobe_plog("DllGetClassObject 真实实现 = %p（dladdr 认不出模块）", (void *)fn);
+    }
     r = fn ? fn(clsid, iid, out) : NULL;
     in_cls = 0;
     hwprobe_plog("DllGetClassObject(clsid=%s, iid=%s) -> hr=0x%lx, factory=%p  [接口创建 #%lu]", cs, is,
@@ -639,8 +822,8 @@ static void dump_map(void)
 static void summary(void)
 {
     hwprobe_plog("--- 汇总 ---");
-    hwprobe_plog("dlopen %lu 次（失败 %lu）；dlsym %lu 次；DllGetClassObject %lu 次",
-         n_dlopen, n_dlopen_fail, n_dlsym, n_cls);
+    hwprobe_plog("dlopen %lu 次（失败 %lu）；dlsym %lu 次；dlvsym %lu 次；DllGetClassObject %lu 次",
+         n_dlopen, n_dlopen_fail, n_dlsym, n_dlvsym, n_cls);
     hwprobe_plog("后端加载情况：NVENC=%s CUDA=%s NVDEC=%s OpenH264(软编)=%s IntelQSV=%s AMF=%s vpx=%s x264=%s avcodec=%s",
          seen_nvenc ? "是" : "否", seen_cuda ? "是" : "否", seen_cuvid ? "是" : "否",
          seen_openh264 ? "是" : "否", seen_mfx ? "是" : "否", seen_amf ? "是" : "否",
@@ -701,9 +884,10 @@ static void maybe_periodic_summary(void)
             (seen_openh264 ? 1 : 0) + (seen_mfx ? 1 : 0) + (seen_amf ? 1 : 0) +
             (seen_vpx ? 1 : 0) + (seen_x264 ? 1 : 0) + (seen_avcodec ? 1 : 0);
     n = snprintf(b, sizeof b,
-        "[hwprobe] 周期汇总 pid=%d dlopen=%lu(失败 %lu) dlsym=%lu DllGetClassObject=%lu "
-        "nvenc_api=%lu nvenc_ver=%lu broadcast-core=%s dlopen库数=%d 编码库=%d\n",
-        (int)getpid(), n_dlopen, n_dlopen_fail, n_dlsym, n_cls,
+        "[hwprobe] 周期汇总 pid=%d dlopen=%lu(失败 %lu) dlsym=%lu dlvsym=%lu "
+        "DllGetClassObject=%lu nvenc_api=%lu nvenc_ver=%lu broadcast-core=%s "
+        "dlopen库数=%d 编码库=%d\n",
+        (int)getpid(), n_dlopen, n_dlopen_fail, n_dlsym, n_dlvsym, n_cls,
         n_nvenc_api, n_nvenc_ver, bc, dl_names_n, nlibs);
     if (n > 0)
         (void)!write(hwprobe_logfd(), b, (size_t)(n < (int)sizeof b ? n : (int)sizeof b - 1));

@@ -9,6 +9,12 @@
 #      A4 槽位统计里能看到热点
 #   B. 默认模式（不设 HWPROBE_VTABLE）：照样跑通，且不代理工厂（默认不动宿主）
 #   C. 日志上限（HWPROBE_VTABLE_MAXLOG=3）生效
+#   D. 直接链接路径（导出符号介入）
+#   E. dlvsym 路径（QQ 真实走的那条）：
+#      E1 调用方经 dlvsym(handle,"DllGetClassObject","VERS_1.0") 取到我们的实现
+#      E2 日志确认走的是 dlvsym 路径，且工厂照样被代理
+#      E3 **反向断言**：探针不能弄坏 glibc 自己的版本化查找
+#         （dlvsym(RTLD_DEFAULT,"dlopen","GLIBC_2.34") != NULL —— 第一版包 dlvsym 就是栽在这）
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 cd "$here"
@@ -77,6 +83,36 @@ else
     echo "  ✓ 调用方没有用 dlsym 取符号"
 fi
 
+echo
+echo "=== E. dlvsym 路径（调用方用版本化符号取入口 —— QQ 真实走的就是这条）"
+gcc -O2 -shared -fPIC -Wl,--version-script=versioned.map -o libfakecom_ver.so fakecom.c || exit 1
+gcc -O2 -o dlvdriver dlvdriver.c -ldl || exit 1
+logE=$(mktemp /tmp/hwprobe-E-XXXX.log)
+outE=$(LD_PRELOAD=../libhwprobe.so HWPROBE_ALL=1 HWPROBE_VTABLE=1 HWPROBE_LOG="$logE" ./dlvdriver 2>&1)
+rcE=$?
+expect_output "$outE" "$rcE"
+echo "$outE" | grep -q "glibc_dlvsym_dlopen=1"       ; chk $? "glibc 自己的版本化查找没被弄坏（GLIBC_2.34 不为 nil）"
+echo "$outE" | grep -q "dlvsym_DllGetClassObject=1"  ; chk $? "调用方经 dlvsym 拿到了入口"
+grep -q "用 dlvsym(handle" "$logE"                   ; chk $? "日志确认走的是 dlvsym 路径"
+grep -q "已代理 IClassFactory" "$logE"               ; chk $? "dlvsym 路径上工厂照样被代理"
+grep -qF 'VERS_1.0") -> ' "$logE"                     ; chk $? "日志里记下了带版本号的查找（VERS_1.0）"
+
+echo
+echo "=== F. 冒烟：会用到版本化查找/dlmopen 的常见程序不能被我们搞坏"
+for cmd in "/bin/true" "niri msg version" "ldd ./dlvdriver" "python3 -c import ctypes"; do
+    # shellcheck disable=SC2086
+    if LD_PRELOAD=../libhwprobe.so $cmd >/dev/null 2>&1; then
+        echo "  ✓ $cmd"
+    else
+        rc=$?
+        # niri 在没有 niri 会话时会非零退出，不算失败；这里只断言"不是被信号打死"
+        if [ "$rc" -ge 128 ]; then echo "  ✗ $cmd 被信号打死（rc=$rc）"; fail=1; else echo "  ✓ $cmd（rc=$rc，非信号）"; fi
+    fi
+done
+
+echo
+echo "=== 日志样本（E 模式：dlvsym 路径）"
+grep -E "dlvsym|符号介入路径" "$logE" | head -6 | sed 's/^/  /'
 echo
 echo "=== 日志样本（A 模式）"
 grep -E "vtable\[[0-9]+\]" "$logA" | head -6 | sed 's/^/  /'
