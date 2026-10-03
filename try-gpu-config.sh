@@ -27,6 +27,7 @@ ICD_NVIDIA=/usr/share/vulkan/icd.d/nvidia_icd.json
 LAUNCHER=linuxqq-wayland-fix
 STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/linuxqq-hwcodec"
 VRAM_BASE_FILE="$STATE_DIR/vram-baseline"
+VRAM_QQ_BASE_FILE="$STATE_DIR/vram-baseline-qq"   # 归因到 qq 的显存基线（判据 3 用）
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
 
@@ -73,6 +74,61 @@ vram_used_mib() {
 	nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' '
 }
 
+# nvidia-smi 默认输出里的 Processes 表（同时含 Graphics 与 Compute 两类）。
+# ⚠️ 这里**不能**用 --query-compute-apps：那只列 CUDA 等计算进程，而 QQ 是**图形**客户端，
+#    永远不会出现在里面 —— 用它判断"上没上独显"是无效证据（历史结论曾被它误导）。
+smi_process_rows() {
+	command -v nvidia-smi >/dev/null 2>&1 || return 0
+	nvidia-smi 2>/dev/null | awk '
+		function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+		/Processes/ { inproc = 1; next }
+		inproc != 1 { next }
+		{
+			line = $0
+			if (line ~ /No running processes/) next
+			if (line !~ /\|/) { inproc = 0; next }
+			body = line
+			sub(/^\|/, "", body); sub(/\|[ \t]*$/, "", body)
+			n = split(body, f, /[ \t]+/)
+			typ = 0
+			for (i = 1; i <= n; i++) if (f[i] == "G" || f[i] == "C") { typ = i; break }
+			if (typ == 0 || typ < 2) next
+			pid = f[typ - 1]; name = (typ + 1 <= n) ? f[typ + 1] : ""
+			mem = ""
+			for (i = n; i >= 1; i--) if (f[i] ~ /^[0-9]+MiB$/) { mem = f[i] + 0; break }
+			printf "%s\t%s\t%s\t%s\n", pid, f[typ], mem, name
+		}'
+}
+
+# 归因到 qq 的显存（按 pid 匹配我们找出来的 qq 进程，比按进程名匹配可靠）。
+# 输出："进程数<TAB>合计MiB"；无法解析时输出 "?"（调用方必须区分"读不到"与"真的是 0"）
+smi_qq_usage() {
+	command -v nvidia-smi >/dev/null 2>&1 || { printf '?'; return 0; }
+	local rows
+	rows=$(smi_process_rows)
+	if [ -z "$rows" ]; then
+		if nvidia-smi 2>/dev/null | grep -q 'Processes'; then printf '0\t0'; else printf '?'; fi
+		return 0
+	fi
+	local qp
+	qp=$(qq_pids | paste -sd'|' -)
+	[ -n "$qp" ] || { printf '0\t0'; return 0; }
+	printf '%s\n' "$rows" | awk -F'\t' -v pids="$qp" '
+		BEGIN { n = split(pids, a, "|"); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+		$1 in want { c++; if ($3 != "") s += $3 }
+		END { printf "%d\t%d", c + 0, s + 0 }'
+}
+
+# 该进程 i915 客户端实际分配了多少（KiB）。0 = 只是个闲置 fd，**不能**据此判失败
+drm_i915_total() {
+	local pid="$1" s=0 v
+	for f in /proc/$pid/fdinfo/*; do
+		v=$(awk '/^drm-driver:[ \t]*i915/ { d = 1 } d && /^drm-total-system0:/ { print $2; exit }' "$f" 2>/dev/null)
+		[ -n "$v" ] && s=$((s + v))
+	done
+	printf '%d' "$s"
+}
+
 # 当前有没有活动的采集流（有才谈得上"显存上涨"）
 video_streams() {
 	command -v pw-dump >/dev/null || { printf '0'; return; }
@@ -87,7 +143,18 @@ mark() {
 	v=$(vram_used_mib)
 	[ -n "$v" ] || die "读不到显存占用（没装 nvidia-smi？）"
 	printf '%s\n' "$v" >"$VRAM_BASE_FILE"
-	printf '已记下基线：显存 %s MiB → %s\n' "$v" "$VRAM_BASE_FILE"
+	printf '已记下基线：全卡显存 %s MiB（未归因，仅供参照）→ %s\n' "$v" "$VRAM_BASE_FILE"
+	local q
+	q=$(smi_qq_usage)
+	case "$q" in
+	'?' | '')
+		printf '注意：读不到 nvidia-smi 的进程表，本次没有"归因到 qq"的基线（判据 3 将不可用）\n'
+		;;
+	*)
+		printf '%s\n' "$q" >"$VRAM_QQ_BASE_FILE"
+		printf '已记下基线：归因到 qq 的显存 %s MiB（%s 个进程）→ %s\n' "${q##*	}" "${q%%	*}" "$VRAM_QQ_BASE_FILE"
+		;;
+	esac
 	printf '现在去开一次共享，跑 20-30 秒，然后在**共享进行中**跑 ./try-gpu-config.sh verdict\n'
 }
 
@@ -115,39 +182,61 @@ verdict() {
 	fi
 
 	echo "--- 独显侧"
-	local vram_now="" base="" delta=""
+	local vram_now="" base="" delta="" qq_now="" qq_base="" qq_delta="" qq_ok=0
 	if command -v nvidia-smi >/dev/null; then
 		vram_now=$(vram_used_mib)
-		nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader 2>/dev/null | sed 's/^/  VRAM: /'
-		local in_smi
-		in_smi=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null | grep -c qq || true)
-		printf '  nvidia-smi 进程列表里的 qq: %s 个\n' "${in_smi:-0}"
+		nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader 2>/dev/null | sed 's/^/  全卡（未归因，仅供参照）: /'
+		qq_now=$(smi_qq_usage)
+		case "$qq_now" in
+		'?' | '')
+			echo "  nvidia-smi 进程表里的 qq: 无法读取（该版本不支持进程表）—— 不作判据"
+			qq_now=""
+			;;
+		*)
+			local qn qm
+			qn="${qq_now%%	*}"
+			qm="${qq_now##*	}"
+			printf '  nvidia-smi 进程表里的 qq: %s 个，合计 %s MiB\n' "$qn" "$qm"
+			if [ -s "$VRAM_QQ_BASE_FILE" ]; then
+				qq_base=$(cat "$VRAM_QQ_BASE_FILE")
+				qq_base=${qq_base##*	}
+				qq_delta=$((qm - qq_base))
+				qq_ok=1
+				printf '  归因到 qq 的显存相对基线（%s MiB）：%+d MiB   ← 判据 3 看这个\n' "$qq_base" "$qq_delta"
+			else
+				echo "  （还没记 qq 归因基线：共享前先跑 mark）"
+			fi
+			;;
+		esac
 		if [ -s "$VRAM_BASE_FILE" ]; then
 			base=$(cat "$VRAM_BASE_FILE")
 			if [ -n "$vram_now" ] && [ -n "$base" ]; then
 				delta=$((vram_now - base))
-				printf '  显存相对基线（%s MiB）：%+d MiB\n' "$base" "$delta"
+				printf '  全卡相对基线（%s MiB）：%+d MiB（未归因，不作判据）\n' "$base" "$delta"
 			fi
 		else
-			echo "  （还没记基线：共享前先跑 ./try-gpu-config.sh mark，才能看出涨了多少）"
+			echo "  （还没记基线：共享前先跑 ./try-gpu-config.sh mark）"
 		fi
 	else
 		echo "  没装 nvidia-smi"
 	fi
 
-	local pp="" devs="" lp=""
+	local pp="" devs="" lp="" i915a=""
 	pp=$(ppapi_pid)
 	if [ -n "$pp" ]; then
 		devs=$(drm_devs "$pp" | paste -sd' ' -)
 		lp=$(llvmpipe_threads "$pp")
+		i915a=$(drm_i915_total "$pp")
 		printf '收帧/编码进程 ppapi: pid=%s 设备=%s %s llvmpipe线程=%s\n' "$pp" "${devs:-（无）}" "$(drm_info "$pp")" "$lp"
+		printf '     它的 i915 客户端分配: %s KiB（0 = 闲置 fd，不算失败）\n' "$i915a"
 	fi
 
 	local streams
 	streams=$(video_streams)
 	printf '活动采集流: %s 个\n' "${streams:-0}"
 
-	echo "--- 结论（三条硬标准：renderD129 + llvmpipe=0 + 共享时显存上涨）"
+	echo "--- 结论（判据：① 收帧进程 llvmpipe 线程=0【决定性】② 它打开 renderD129 ③ 归因到 qq 的显存增长【辅助】）"
+	echo "    注意：判据 ③ 以前用的是整卡差值（未归因），那会把别的进程的开销算成收益，已于 2026-10-03 修正"
 	if [ -z "$pids" ]; then
 		echo "  无法判断（QQ 没在运行）"
 		return
@@ -159,30 +248,37 @@ verdict() {
 		return
 	fi
 
+	# 判据 1（决定性）：只要收帧进程里有 llvmpipe 线程，就是在用 CPU 软件渲染，与哪块 GPU 无关
+	if [ "${lp:-0}" -gt 0 ]; then
+		echo "  ❌ 判据 1 未过：收帧进程里有 ${lp} 个 llvmpipe 线程 —— 实际在软件渲染（CPU）"
+		echo "     这条是决定性的：有它就不能算「上了独显」，设备节点开没开、显存涨没涨都不作数"
+		return
+	fi
+
 	if ! printf '%s' "$devs" | grep -q renderD129; then
-		echo "  ❌ 收帧进程在核显（i915）上 —— 共享占用记进系统内存（Shmem），这就是会冻机的那条路"
+		echo "  ❌ 判据 2 未过：收帧进程没打开 renderD129（只有核显设备）—— 共享占用记进系统内存（Shmem）"
+		if [ "${i915a:-0}" -gt 0 ]; then
+			echo "     （它的 i915 客户端确实分配了 ${i915a} KiB，不是闲置 fd）"
+		else
+			echo "     （它的 i915 客户端分配为 0 —— 但判据 2 依然不过，因为根本没打开独显节点）"
+		fi
 		[ "${n_nv:-0}" -gt 0 ] && echo "     （其它 qq 子进程碰过 renderD129，但堆积不记在它们身上，不算数）"
 		return
 	fi
 
-	if [ "${lp:-0}" -gt 0 ]; then
-		echo "  ⚠️ 假阳性：收帧进程确实打开了 renderD129，但里面还有 ${lp} 个 llvmpipe 线程"
-		echo "     说明实际渲染仍走软件渲染，不是真上独显（prime-1 实测就是这样）"
-		return
-	fi
-
-	echo "  ✓ 硬标准 1、2 通过：收帧进程打开了 renderD129，且没有 llvmpipe 线程"
-	if [ "${streams:-0}" -gt 0 ] && [ -n "$delta" ]; then
-		if [ "$delta" -ge 100 ]; then
-			echo "  ✅ 硬标准 3 也通过：共享中显存涨了 ${delta} MiB —— 真的在独显上干活了"
-			echo "     （记得确认对端能看到画面、且画面正常；顺便看 wayland-cast-doctor 的 Shmem 增速）"
-		elif [ "$delta" -ge 32 ]; then
-			echo "  🟡 显存涨了 ${delta} MiB（轻微）—— 有动静但不大，建议多跑一会儿再看"
+	echo "  ✓ 判据 1、2 通过：收帧进程打开了 renderD129，且没有 llvmpipe 线程"
+	echo "     （它同时持有的 i915 fd 分配量 = ${i915a:-0} KiB：0 说明只是闲置 fd，不算失败）"
+	if [ "${streams:-0}" -gt 0 ] && [ "$qq_ok" = 1 ] && [ -n "$qq_delta" ]; then
+		if [ "$qq_delta" -ge 100 ]; then
+			echo "  ✅ 判据 3 也通过：归因到 qq 的显存涨了 ${qq_delta} MiB —— 确实在独显上干活"
+			echo "     （记得确认对端能看到画面、画面正常；并看 wayland-cast-doctor 的 Shmem 增速）"
+		elif [ "$qq_delta" -ge 32 ]; then
+			echo "  🟡 归因到 qq 的显存涨了 ${qq_delta} MiB（轻微）—— 有动静但不大，建议多跑一会儿再看"
 		else
-			echo "  ⚠️ 共享中显存几乎没涨（${delta} MiB）—— 可能只是挂了设备节点，实际没在独显上干活"
+			echo "  ⚠️ 归因到 qq 的显存几乎没涨（${qq_delta} MiB）—— 可能只是挂了设备节点，实际没在独显上干活"
 		fi
 	else
-		echo "  🟡 还差硬标准 3：先 ./try-gpu-config.sh mark，再开共享，然后共享进行中再跑本命令"
+		echo "  🟡 还差判据 3：先 mark（记全卡 + qq 归因两个基线），再开共享，共享进行中再跑本命令"
 	fi
 }
 
