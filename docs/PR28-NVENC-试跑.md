@@ -470,3 +470,53 @@ grep -aE '\[FIXKEY\]|封装=' /run/user/1000/linuxqq-wayland-fix.log | tail -12
 
 把 `fixkey_build` 抠出来单测，7 项全过：P 帧补齐前缀 ✓、已带参数集（4 字节 / 3 字节起始码）不重复补 ✓、
 垃圾输入安全 ✓、大帧多次调用容量增长不越界 ✓、未缓存参数集时退化为纯复制 ✓。
+
+## 2026-10-03 第二轮：FORCEIDR 被驱动忽略 + 参数集取不到（已在补丁里修）
+
+### 用户实测（HEXDUMP + FIXKEY 诊断行）
+
+```
+[NVENC] 封装=Annex-B(4字节起始码) SPS=无 PPS=无 IDR=无 非IDR=有 profile=?
+[FIXKEY] req_flags=0x4 pictureType=0 is_idr=0 距上次IDR=1 帧      ← 0x4 = 只有 OUTPUT_SPSPPS，没有 FORCEIDR(0x2)
+…（持续到 6 帧，形态不变）
+```
+
+### 两条根因
+
+1. **驱动不守约**：`FORCEIDR` 请求了也不给 IDR（`pictureType=0` 一直是非 IDR）→ 没有 IDR，`OUTPUT_SPSPPS` 自然也不输出参数集。
+   → **修法**：`QQ_NVENC_REOPEN_IDR` **默认改为开**（FIXKEY 打开时）。请求了 IDR 但驱动仍不给 → 下一帧**重开会话**，新会话必然带 SPS/PPS + 关键帧 ✓
+2. **`nvEncGetSequenceParams` 在初始化后立刻调用取不到东西**（驱动要等第一帧之后）。
+   → **修法**：编码后**每次重试**，并**优先从码流里抠** SPS(7)/PPS(8) 缓存；**一旦拿到参数集，下一帧立刻强制 IDR**，这样接收端第一次收到的就是「SPS+PPS+IDR」的完整起点 ✓
+
+### 诊断也改了（这次是 tail 害的）
+
+以前的 `[FIXKEY]` 诊断行受 `encode_calls < 8` 限制、又被 `tail -12` 截掉，**首帧那行（唯一带 FORCEIDR 的）看不到** ✗
+现在：**前 3 帧 + 每次请求 IDR 的帧一定打**，并带 `obj=`（区分多个编码器对象）、`第N帧`、`参数集=N 字节` ✓
+
+### 用户命令
+
+```bash
+# 完全退出 QQ
+QQ_WAYLAND_FIX_ANGLE=off LD_PRELOAD=$HOME/coding/linuxqq-hwcodec/libqq-nvenc.so \
+QQ_NVENC=1 QQ_NVENC_ACTIVE=1 QQ_NVENC_FIXKEY=1 QQ_NVENC_HEXDUMP=1 linuxqq-wayland-fix
+
+# 开共享、动着屏幕，然后【不要用 tail 截掉开头】：
+grep -aE '\[FIXKEY\]' /run/user/1000/linuxqq-wayland-fix.log | head -20
+grep -aE '封装=' /run/user/1000/linuxqq-wayland-fix.log | tail -5
+```
+
+### 判读
+
+| 看到 | 含义 |
+|---|---|
+| `第1帧 … req_flags=0x6` | 首帧确实请求了 FORCEIDR ✓（之前那行被 tail 截掉了） |
+| `从码流抠到 SPS/PPS N 字节` 或 `编码后取到 SPS/PPS N 字节` | 参数集拿到了 ✓，下一帧会强制 IDR |
+| `驱动未按请求给 IDR —— 重开会话强制出关键帧` | 兜底路径在工作 ✓ |
+| `封装=… SPS=有 PPS=有 IDR=有` + **对端出画面** | ✅ **成功** |
+| 一直 `SPS=无` 且 `参数集=0` | 把 `第1帧` 那行 + `编码后仍取不到 SPS/PPS status=N` 发回 |
+| 有 `SPS=有` 但没有 `IDR=有` | 把 `驱动未按请求给 IDR` 之后的行发回（重开会话也没 IDR 的话） |
+
+### 离线单测
+
+`test/fixkey-ps-test.sh` —— **把源码里的 `fixkey_grab_ps()` / `fixkey_build()` 按大括号配平切出来**、配最小 shim 编译运行（测的是真代码，不是重写一份）：
+4/3 字节起始码抠取、纯 P 帧不抠、已有缓存不重复、垃圾输入安全、前缀拼装正确、已带参数集不重复补、70KB 大帧容量增长不越界 —— **15 项全过** ✓
