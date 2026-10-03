@@ -3,10 +3,23 @@
 实验项目：让 LinuxQQ 的屏幕共享走 **硬件编解码（NVIDIA NVENC/NVDEC）**。
 
 - **Phase 1 已完成**：探针查明它选了哪条编码路径 —— **全程没有任何编码库被 dlopen**、`NVENC 初始化 0 次`
-  → 软编静态编进了 `broadcast-core.so`，NVENC 从未被尝试。
+  → 软编**不在 broadcast-core.so 里**，而在 `libAVSDKPlugin.so`（静态 OpenH264）；broadcast-core 的 NVENC 从未被调用过（**2026-10-03 由 PR #28 证伪并修正**）。
 - **Phase 2 已就绪**：COM 层观测（编码器选择发生在哪个接口方法里），**默认关闭**，`HWPROBE_VTABLE=1` 才开。
 
 > 想让它跑在 N 卡上（不是编码，是渲染/解码，价值是堆积落显存而不是系统内存）：见文末「让 QQ 跑在 N 卡上：实验矩阵」。
+
+> ## ⚠️ 2026-10-03 更新：这条结论已被上游实验 PR 部分推翻
+>
+> 上游 PR **#28「screenshare: 可选改用 NVENC 编 H.264」**（作者 FJKiXfaR，就是提内存泄漏 issue #19 的那位）
+> 用 **inline hook 直接换掉编码器本体**：hook `libAVSDKPlugin.so` 的 `CreateH264Encoder`，把返回对象的 vtable
+> 指向自己的实现，用 NVENC 出流后按原契约回调。它**绕开了下面所有"走不通"的路** —— 不需要 COM 入口、
+> 不需要符号介入、也不需要腾讯给开关。
+>
+> 所以准确表述是：**「腾讯没给开关」成立，「用户侧做不到」不成立**。代价是依赖入口字节匹配、**对 QQ 版本敏感**。
+> 试跑步骤与判据见 [`docs/PR28-NVENC-试跑.md`](docs/PR28-NVENC-试跑.md)。下面的调查记录原样保留作为历史。
+>
+> 它还顺手修正了本页第 1 行的说法：**软编不在 `broadcast-core.so` 里，而在 `libAVSDKPlugin.so`**（静态 OpenH264/o264rt 包装层），
+> `broadcast-core.so` 的 NVENC 实现**从未被调用**；`AVSDK_SetHWAbility` 打开也没用，因为**没有硬件实现可指**。
 
 ## 结论：为什么用户侧切不了硬编
 
@@ -23,6 +36,7 @@
 | 5 | 拦编码器本体（`libAVSDKPlugin.so`） | **不行**：它带 `FLAGS: SYMBOLIC`（`readelf -d`），内部调用绑定到自己，`LD_PRELOAD` 拦不到内部调用点 |
 | 6 | SDK 自带的测试配置文件（最后一搏） | **实测无效**：键写对了、文件放进了 QQ 的工作目录、QQ 也在文件之后重启过 —— 日志**毫无输出**，见下一节 |
 | 7 | 要真硬编 | 需**腾讯在 Electron 侧给出开关**（或换客户端）；配置、环境变量、符号介入三条路都到不了那个判断点 |
+| 8 | **inline hook 换掉编码器**（上游 PR #28） | ✅ **可行，社区已实现**：hook `libAVSDKPlugin.so` 的 `CreateH264Encoder`、替换返回对象 vtable、改用 NVENC 出流 —— 不需要 COM 入口、不需要符号介入、不需要腾讯给开关。见 [`docs/PR28-NVENC-试跑.md`](docs/PR28-NVENC-试跑.md) |
 
 定位过程本身仍有价值：探针现在能证明「谁加载了 broadcast-core、取过哪些符号、调用了哪些接口」——
 只是这次它证明的是**那条路没人走**。
