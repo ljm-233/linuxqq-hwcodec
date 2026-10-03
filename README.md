@@ -6,6 +6,8 @@
   → 软编静态编进了 `broadcast-core.so`，NVENC 从未被尝试。
 - **Phase 2 已就绪**：COM 层观测（编码器选择发生在哪个接口方法里），**默认关闭**，`HWPROBE_VTABLE=1` 才开。
 
+> 想让它跑在 N 卡上（不是编码，是渲染/解码，价值是堆积落显存而不是系统内存）：见文末「让 QQ 跑在 N 卡上：实验矩阵」。
+
 ## 结论：为什么用户侧切不了硬编
 
 **PC 版 QQ 有 NVENC 实现，但用户侧没有任何入口能让它走硬编**；现在实际在编码的是
@@ -298,3 +300,38 @@ dlsym/dlvsym 查找名 top8（共 4 种）：cos=2 sin=1 pow=1 NvEncodeAPICreate
 
 退出汇总印 top-8，周期汇总印 `查找名top3=`；想看逐条明细仍然用 `HWPROBE_ALL=1`。
 
+## 让 QQ 跑在 N 卡上：实验矩阵
+
+**为什么做这件事**：QQ 跑在核显（i915）上时，它持有的缓冲记账在**系统内存**（`/proc/meminfo`
+的 `Shmem`），共享时会一路涨到把机器冻死；跑在独显上，同样的堆积落在**显存（8 GB）**，机器不容易冻。
+注意这与"硬件**编码**"是两件事 —— 后者今天已证明用户侧改不了（见顶部结论）。
+
+**已知走不通的两条**（先前会话实测，别再试）：
+- 强制 NVIDIA **EGL**（`__EGL_VENDOR_LIBRARY_FILENAMES=10_nvidia.json`）：EGL 确实换成了 NVIDIA、
+  llvmpipe 消失、ppapi CPU 从 ~273% 降到 ~5%，**但对端没有画面**；`eglinfo` 的原因：
+  `Wayland platform: eglInitialize failed`（Mesa 在同一平台成功）
+- `DRI_PRIME=2`：被 Mesa 拒绝（`Should be < 2 (GPU devices count)`）
+
+| 配置 | 改什么 | 期望 | 风险 |
+|---|---|---|---|
+| `baseline` | 什么都不改（= 你现在在用的） | 核显 + llvmpipe，画面正常 | 无（作为对照与回退） |
+| `vulkan-nvidia` | `VK_ICD_FILENAMES`/`VK_DRIVER_FILES` 锁 NVIDIA ICD + `QQ_WAYLAND_FIX_ANGLE=vulkan` | ANGLE 走 NVIDIA Vulkan，最可能真上独显 | **画面可能变小** —— `--use-angle=vulkan` 正是"视频画面缩放错乱"的元凶（你今天为此固化了 `QQ_WAYLAND_FIX_ANGLE=off`） |
+| `angle-gl-nvidia` | `QQ_WAYLAND_FIX_ANGLE=off` + 追加 `--use-gl=angle --use-angle=gl`（启动器会把参数原样透传） | 走 ANGLE 桌面 GL（经 GLX/NVIDIA），绕开 EGL 那个失败点 | GLX 在 Wayland 下不一定可用 |
+| `prime-1` | `DRI_PRIME=1` | Mesa 自己选设备 | 先前只试过 2/0，1 未试；可能仍落在核显 |
+
+**判据只有一条**：`verdict` 里**收帧进程 ppapi** 打开的是 `renderD129`（NVIDIA）。
+其它子进程碰过 renderD129 不算 —— 堆积记在 ppapi 身上。
+
+```
+./try-gpu-config.sh verdict            # 只读：现在到底在哪个 GPU 上（随时可跑）
+./try-gpu-config.sh dry-run vulkan-nvidia   # 先看将要执行什么，不启动
+./try-gpu-config.sh vulkan-nvidia      # 用该配置启动（要求 QQ 已完全退出）
+./try-gpu-config.sh baseline           # 回到你现在这个正常状态
+```
+
+**两个目标可能冲突**：让 ANGLE 走 NVIDIA（`vulkan-nvidia`）与"画面不变小"（需要 `QQ_WAYLAND_FIX_ANGLE=off`）
+目前看是矛盾的。建议顺序：先试 `angle-gl-nvidia`（不碰 ANGLE 的 vulkan 后端，画面风险最小），
+再试 `vulkan-nvidia`（最可能上独显，但要接受画面可能变小）；**优先保证画面正常** —— 上不了独显只是
+"会冻机"的老问题（已有档位与刹车兜住），画面坏了共享就没法用了。
+
+本脚本**不会杀任何进程**：QQ 还在跑时它会拒绝启动（QQ 是单实例，不退出新实例不会接管）。
