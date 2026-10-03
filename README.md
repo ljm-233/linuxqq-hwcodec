@@ -317,6 +317,10 @@ dlsym/dlvsym 查找名 top8（共 4 种）：cos=2 sin=1 pow=1 NvEncodeAPICreate
 同理 `xwayland-nvidia` 那次 VRAM 涨了 356 MiB，**但涨在别的 qq 子进程上，ppapi 仍在 i915** ✗。
 只看到一个数字就下结论，会被假阳性骗。
 
+**还有一条更贵的教训**：`bwrap-hide-igpu` 那次曾看到「VRAM +712 MiB」，我一度当成收益 ——
+其实那**是 QQ 启动时的分配，不是共享产生的**；按 `mark` 基线重测，共享期间实际是 **-27 MiB**。
+所以：**判断显存必须先用 `mark` 记基线、再在共享中测差值**，否则会把启动开销当成收益 ✗。
+
 ### 已实测失败的配置（别再试，死亡原因都量过）
 
 | 配置 | 做法 | 结果 |
@@ -330,7 +334,7 @@ dlsym/dlvsym 查找名 top8（共 4 种）：cos=2 sin=1 pow=1 NvEncodeAPICreate
 
 **共同死因**：在 niri + Wayland + 混合显卡下，Electron/ANGLE **自己决定用哪块 GPU**，环境变量拉不动它。
 
-### 还没试的两个（强制手段）
+### 后来也试了（强制手段，同样失败）
 
 | 配置 | 做法 | 期望 | 风险 |
 |---|---|---|---|
@@ -358,3 +362,29 @@ dlsym/dlvsym 查找名 top8（共 4 种）：cos=2 sin=1 pow=1 NvEncodeAPICreate
 老问题（已有 `saver` 档 + 刹车兜住，实测共享中 `Shmem` 平稳），画面坏了共享就直接不能用。
 
 本脚本**不会杀任何进程**：QQ 还在跑时它会拒绝启动（QQ 是单实例，不退出新实例不会接管）。
+
+## 结论：本机无法让 QQ 跑在 N 卡上
+
+**七个配置全部失败（全部实测）**，「让 QQ 跑在 N 卡上」在本机用户侧**不可实现**。
+
+| 配置 | 死因 |
+|---|---|
+| `baseline` | 本来就在核显 |
+| `angle-gl-nvidia` | GLX 需要 X11，QQ 是原生 Wayland → ANGLE 回退 |
+| `prime-1` | Mesa 收下变量，实际落到 llvmpipe 软件渲染 |
+| `vulkan-nvidia` | 强制 NVIDIA ICD 仍挑 Intel Vulkan；且画面变小 |
+| `xwayland-nvidia` | ppapi 仍 renderD128；VRAM 涨在别的子进程（假阳性） |
+| `bwrap-hide-igpu` | 命名空间只剩 N 卡，它宁可 llvmpipe 也不上 |
+| `xwayland-bwrap` | 同上（X11 + 只暴露 N 卡仍落 llvmpipe） |
+
+**根因**：这套环境下客户端**拿不到可用的 NVIDIA GL/EGL** —— NVIDIA EGL 在 Wayland 下
+`eglInitialize` 失败（上个会话实测）、GLX 只在 X11 可用、Mesa 的 `DRI_PRIME` 落到 llvmpipe、
+强制 Vulkan ICD 无效。属于「驱动 + Electron/ANGLE + 混合显卡 + Wayland」的交互问题，
+**用户侧无解**；换 Mesa 的 NVK（nouveau）要替换整个 NVIDIA 驱动栈，不建议。
+
+**已经解决的部分**（别把上面这条当成"什么都没修"）：
+
+- **不冻机**：`saver` 档（15fps + 960×600）+ 内存刹车 → 共享期间 `Shmem` 稳定（0~1 MB/s），多次实测
+- **画面正常**：`QQ_WAYLAND_FIX_ANGLE=off` 修掉了"视频画面缩成小图"
+- 现在可用的状态就是 `baseline`（核显 + llvmpipe + ANGLE off）
+- 完整过程与可复现命令见 `docs/上独显尝试.md`
