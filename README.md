@@ -6,6 +6,25 @@
   → 软编静态编进了 `broadcast-core.so`，NVENC 从未被尝试。
 - **Phase 2 已就绪**：COM 层观测（编码器选择发生在哪个接口方法里），**默认关闭**，`HWPROBE_VTABLE=1` 才开。
 
+## 结论：为什么用户侧切不了硬编
+
+**PC 版 QQ 有 NVENC 实现，但用户侧没有任何入口能让它走硬编**；现在实际在编码的是
+`libAVSDKPlugin.so` 自带的**软件**编码器（OpenH264 量级，实测 2560×1600 下每秒只编得动约 6 帧）。
+完整证据、命令与日志片段见 [`docs/硬件编码调查.md`](docs/硬件编码调查.md)。
+
+| # | 尝试 | 结果 |
+|---|---|---|
+| 1 | NVENC 实现在不在 | **在** `avsdk/broadcast-core.so`：`NvEncoder_Create/InitEncConfig/DoEncode`、`NvEncodeAPICreateInstance`、NVDEC（`cuvidCreateDecoder`）、AMD AMF、软编兜底 `OpenH264Encoder_*`；源码路径串 `…/broadcast-core/linux/NvEncoder.c` |
+| 2 | 库齐不齐 | **齐**：`libnvidia-encode.so.1` / `libcuda.so.1` / `libnvcuvid.so.1` 都在，dlopen 实测全部成功 → **缺的不是库**（`libmfx.so.1`、`libamfrt64.so.1` 缺失） |
+| 3 | 走 COM 入口强制 | **此路不通**：`broadcast-core.so` 只导出 3 个符号；探针实测共享全程 `dlsym=0`、`dlvsym` 77 次**无一**取 `DllGetClassObject`、`DllGetClassObject=0` → 那条路**根本没被走** |
+| 4 | 按名字 hook `BroadcastCore_*` | **不行**：这些名字只在**字符串表**里（COM 接口方法名），没有导出 |
+| 5 | 拦编码器本体（`libAVSDKPlugin.so`） | **不行**：它带 `FLAGS: SYMBOLIC`（`readelf -d`），内部调用绑定到自己，`LD_PRELOAD` 拦不到内部调用点 |
+| 6 | SDK 自带的测试配置文件（最后一搏） | **实测无效**：键写对了、文件放进了 QQ 的工作目录、QQ 也在文件之后重启过 —— 日志**毫无输出**，见下一节 |
+| 7 | 要真硬编 | 需**腾讯在 Electron 侧给出开关**（或换客户端）；配置、环境变量、符号介入三条路都到不了那个判断点 |
+
+定位过程本身仍有价值：探针现在能证明「谁加载了 broadcast-core、取过哪些符号、调用了哪些接口」——
+只是这次它证明的是**那条路没人走**。
+
 ## 已知事实（本机调查，2026-10-03）
 
 | 事项 | 结论 |
@@ -242,35 +261,31 @@ ppapi 进程里探针在（maps 里能看到）、`HWPROBE_LOG` 也设了，**�
 每个进程块都带 `命令行：…` 与 `父进程：N`，不用再猜哪块是哪个进程。不想启动 QQ、只想看现状：
 `./linuxqq-hwcodec-probe --selfcheck-once`（失败时退出码非 0）。
 
-## 下一步线索（2026-10-03 静态分析所得，尚未实验）
+## 那次"最后一搏"：测试配置文件实测无效（2026-10-03）
 
-**编码器不在 broadcast-core，而在 `libAVSDKPlugin.so`。** 证据：`broadcast-core.so` 只导出三个
-COM 符号，`libAVSDKPlugin.so` 既不 NEEDED 它、也不引用任何 `BroadcastCore_*`；而
-`libAVSDKPlugin.so`（33 MB，7961 个导出符号）自带 `CreateH264Encoder`、`O264rtCreateSVCEncoder`、
-整份 FFmpeg H.264 代码，以及这些运行期日志串：
+SDK 里的字符串确实承诺了两个"本地测试配置文件"开关：
 
-```
-CVideoEncoder::Init CodecType: %d, size: %dx%d, enc: %dx%d, fps: %d, bitrate: %d, …, hardware: %d
-CVideoEncoder::ReadyEncode reset video encoder: … use_hardware[%d]
-```
-
-**坏消息**：`libAVSDKPlugin.so` 带 `FLAGS: SYMBOLIC`（`readelf -d` 可见），**内部调用绑定到自己**，
-所以对它的导出函数做 `LD_PRELOAD` 介入，拦不到库内部的调用点 —— COM 那条路（broadcast-core）
-虽然能介入，但它的 `DllGetClassObject` 在共享过程中**一次都没被调用**（实测 `dlsym=0 dlvsym` 里
-也没有它）。
-
-**好消息**：AVSDK 自带两个**测试配置文件**，里面有硬件开关，而且**生效与否会自己打日志**：
-
-| 文件 | 键 | 日志串 |
+| 文件 | 键 | 命中时会打的日志 |
 |---|---|---|
-| `aMavEngineConfig.txt` | `uiUseHw`（还有 uiWidth/uiHeight/uiFPS/uiBitrate/uiGop/uiMinQP/uiMaxQP/emGopType） | `aMavEngineConfig.txt: uiUseHw[%d->%d]` |
-| `aConfig.txt` | `dwUseHWAccelerate`（还有 dwBitRate/dwFPS/dwGOP/dwWidth） | `be careful local has test config file aConfig.txt: dwUseHWAccelerate[%d->%d]` |
+| `aMavEngineConfig.txt` | `uiUseHw`、`uiUseHWAccelerate` | `aMavEngineConfig.txt: uiUseHw[%d->%d]` |
+| `aConfig.txt` | `dwUseHWAccelerate`、`HwEnc` | `be careful local has test config file aConfig.txt: dwUseHWAccelerate[%d->%d]` |
 
-这两个文件名是**相对路径**（SDK 用 `fopen` 按进程工作目录找），所以把文件放到**启动 QQ 的那个
-目录**里即可；AVSDK 的日志会出现在启动器日志里（`/run/user/1000/linuxqq-wayland-fix.log`）。
+实测过程（**文件按 SDK 的相对路径语义放进 QQ 的进程工作目录**）：
 
-**因此下一步不需要再挂探针**：放配置文件 → 重启 QQ → 开共享 → 看日志里有没有
-`uiUseHw[0->1]` 以及 `CVideoEncoder::Init … hardware: 1`。
+```bash
+readlink /proc/$(pgrep -x qq | head -1)/cwd        # → /home/link，证明工作目录
+printf 'uiUseHw=1\nuiUseHWAccelerate=1\n' > /home/link/aMavEngineConfig.txt
+printf 'HwEnc = 1\ndwUseHWAccelerate = 1\n' > /home/link/aConfig.txt
+# 完全退出 QQ → 重启（进程启动时间晚于两个文件的 mtime）→ 开一次共享
+grep -aiE 'HwEnc|uiUseHw|UseHWAccelerate|hardware:|use_hardware' \
+     /run/user/1000/linuxqq-wayland-fix.log | tail
+```
+
+结果：**没有任何输出**（既没有 `[0->1]`，也没有加载/解析失败的任何提示）。
+
+判定：这段"本地测试配置文件"代码在 PC 版里**很可能未启用** —— 旁证是库里那条配置路径写的是
+Android 的绝对路径 `/sdcard/Android/data/com.tencent.mobileqq/aMavEngineConfig.txt`（该库是手机端
+共用的）。因此**用户侧无手段切换到硬编**，这就是本项目的最终答案。
 
 ## 查找名统计（2026-10-03 新增）
 

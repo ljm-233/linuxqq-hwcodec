@@ -1,6 +1,8 @@
-*.so
+aConfig.txt
+aMavEngineConfig.txt
 *.o
 probe-*.log
+*.so
+test/direct
 test/driver
 test/libfakecom.so
-test/direct
