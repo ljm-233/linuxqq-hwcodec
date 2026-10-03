@@ -415,3 +415,58 @@ QQ_NVENC=1 QQ_NVENC_ACTIVE=1 QQ_NVENC_BASELINE=1 linuxqq-wayland-fix
 | C 关掉 NVENC（可用态） | 只留 `QQ_NVENC=1` | 画面正常 ✓（对照组） |
 
 （本轮新增：`QQ_NVENC_HEXDUMP`、`QQ_NVENC_BASELINE`；本地累计改动见 `patches/pr28-local-experiments.patch`，包含异步回调 + 这两个开关。）
+
+## 病因与修复：SPS/PPS + 强制 IDR（`QQ_NVENC_FIXKEY=1`）
+
+### 铁证（用户实测 HEXDUMP 输出）
+
+```
+[NVENC] 码流 len=171 首 16 字节: 00 00 00 01 09 30 00 00 00 01 61 e0 39 04 5f 00
+[NVENC] 封装=Annex-B(4字节起始码) SPS=无 PPS=无 IDR=无 非IDR=有 profile=?
+```
+
+逐 NAL 拆开：`00 00 00 01 09 30` = AUD（type 9）；`00 00 00 01 61 e0 …` = **type 1，非 IDR**。
+连续多帧都是这个形态 —— **没有 SPS/PPS、没有任何 IDR（关键帧）** ✗
+
+H.264 必须先有 **SPS/PPS + 一个 IDR** 才能起播；只有 P 帧 = 一堆无法解码的差分数据 → **对端永远转圈** ✓
+这就是病因（会话几何、packet 偏移、回调时序此前已逐个排除）。
+
+### 为什么原来的设置没生效
+
+代码里其实都设了：`idrPeriod = fps*2`、`repeatSPSPPS = 1`、`outputAUD = 1`，每帧也带
+`NV_ENC_PIC_FLAG_OUTPUT_SPSPPS`，首帧还会加 `NV_ENC_PIC_FLAG_FORCEIDR`（`enablePTD = 1`，flag 合法）。
+**但实测驱动就是不给 IDR、也不给参数集** —— 所以修法不能只依赖驱动守约 ✗
+
+### 修了什么（`QQ_NVENC_FIXKEY=1`，默认关 = 原 PR 行为，可直接 A/B）
+
+| 机制 | 说明 |
+|---|---|
+| **自己记 IDR 周期** | 首帧 + 每 `QQ_NVENC_IDR_INTERVAL`（默认 60）帧请求一次 `FORCEIDR`，不再依赖驱动的 `idrPeriod` |
+| **参数集前缀** | 会话就绪后用 `nvEncGetSequenceParams` 缓存 SPS/PPS，**每帧码流前补一份**（码流里已含参数集时不重复补）；码流缓冲 Unlock 后失效，所以**先复制进我们自己的缓冲**再递下去 |
+| **兜底重开** | `QQ_NVENC_REOPEN_IDR=1`：请求了 IDR 但驱动的 `pictureType` 仍不是 IDR → 下一帧重开会话（新会话必然带 SPS/PPS + IDR）|
+| **诊断** | `QQ_NVENC_HEXDUMP=1` 时，前 8 帧打印 `req_flags` / `pictureType` / `is_idr` / 距上次 IDR 的帧数 |
+
+### 怎么跑
+
+```bash
+# 完全退出 QQ（托盘；环境变量只在启动时读一次）
+QQ_WAYLAND_FIX_ANGLE=off LD_PRELOAD=$HOME/coding/linuxqq-hwcodec/libqq-nvenc.so \
+QQ_NVENC=1 QQ_NVENC_ACTIVE=1 QQ_NVENC_FIXKEY=1 QQ_NVENC_HEXDUMP=1 linuxqq-wayland-fix
+
+# 开共享、动着屏幕，然后：
+grep -aE '\[FIXKEY\]|封装=' /run/user/1000/linuxqq-wayland-fix.log | tail -12
+```
+
+### 判读
+
+| 看到什么 | 结论 |
+|---|---|
+| `SPS=有 PPS=有 IDR=有` 且**对端出画面** | ✅ 修复成功 |
+| `SPS=有 PPS=有` 但一直 `IDR=无` | 驱动忽略了 FORCEIDR → 加 `QQ_NVENC_REOPEN_IDR=1` 再试 |
+| 仍 `SPS=无` | 参数集缓存失败（日志里有 `[FIXKEY] 取 SPS/PPS 失败 status=…`）→ 把 status 号发出来 |
+| 码流已带参数集+IDR 但对端仍转圈 | 那就不是码流内容的问题，需要抓对端解码器日志（留给作者）|
+
+### 离线验证（本机已过，不依赖 GUI）
+
+把 `fixkey_build` 抠出来单测，7 项全过：P 帧补齐前缀 ✓、已带参数集（4 字节 / 3 字节起始码）不重复补 ✓、
+垃圾输入安全 ✓、大帧多次调用容量增长不越界 ✓、未缓存参数集时退化为纯复制 ✓。

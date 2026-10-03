@@ -422,3 +422,9 @@ dlsym/dlvsym 查找名 top8（共 4 种）：cos=2 sin=1 pow=1 NvEncodeAPICreate
 - **画面正常**：`QQ_WAYLAND_FIX_ANGLE=off` 修掉了"视频画面缩成小图"
 - 现在可用的状态就是 `baseline`（核显 + llvmpipe + ANGLE off）
 - 完整过程与可复现命令见 `docs/上独显尝试.md`
+
+### 对端转圈（黑屏）的定位与修复
+
+`docs/PR28-NVENC-试跑.md` 里记了完整链条：几何 / packet 偏移 / 回调时序逐个排除后，
+**真因是码流里没有 SPS/PPS、也没有 IDR**（只有 AUD + P 帧），接收端无法起播。
+`QQ_NVENC_FIXKEY=1` 让探针自己保证「首帧与每 N 帧强制 IDR + 每帧补参数集」，并带兜底重开与诊断开关。
