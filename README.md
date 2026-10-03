@@ -241,3 +241,45 @@ ppapi 进程里探针在（maps 里能看到）、`HWPROBE_LOG` 也设了，**�
 
 每个进程块都带 `命令行：…` 与 `父进程：N`，不用再猜哪块是哪个进程。不想启动 QQ、只想看现状：
 `./linuxqq-hwcodec-probe --selfcheck-once`（失败时退出码非 0）。
+
+## 下一步线索（2026-10-03 静态分析所得，尚未实验）
+
+**编码器不在 broadcast-core，而在 `libAVSDKPlugin.so`。** 证据：`broadcast-core.so` 只导出三个
+COM 符号，`libAVSDKPlugin.so` 既不 NEEDED 它、也不引用任何 `BroadcastCore_*`；而
+`libAVSDKPlugin.so`（33 MB，7961 个导出符号）自带 `CreateH264Encoder`、`O264rtCreateSVCEncoder`、
+整份 FFmpeg H.264 代码，以及这些运行期日志串：
+
+```
+CVideoEncoder::Init CodecType: %d, size: %dx%d, enc: %dx%d, fps: %d, bitrate: %d, …, hardware: %d
+CVideoEncoder::ReadyEncode reset video encoder: … use_hardware[%d]
+```
+
+**坏消息**：`libAVSDKPlugin.so` 带 `FLAGS: SYMBOLIC`（`readelf -d` 可见），**内部调用绑定到自己**，
+所以对它的导出函数做 `LD_PRELOAD` 介入，拦不到库内部的调用点 —— COM 那条路（broadcast-core）
+虽然能介入，但它的 `DllGetClassObject` 在共享过程中**一次都没被调用**（实测 `dlsym=0 dlvsym` 里
+也没有它）。
+
+**好消息**：AVSDK 自带两个**测试配置文件**，里面有硬件开关，而且**生效与否会自己打日志**：
+
+| 文件 | 键 | 日志串 |
+|---|---|---|
+| `aMavEngineConfig.txt` | `uiUseHw`（还有 uiWidth/uiHeight/uiFPS/uiBitrate/uiGop/uiMinQP/uiMaxQP/emGopType） | `aMavEngineConfig.txt: uiUseHw[%d->%d]` |
+| `aConfig.txt` | `dwUseHWAccelerate`（还有 dwBitRate/dwFPS/dwGOP/dwWidth） | `be careful local has test config file aConfig.txt: dwUseHWAccelerate[%d->%d]` |
+
+这两个文件名是**相对路径**（SDK 用 `fopen` 按进程工作目录找），所以把文件放到**启动 QQ 的那个
+目录**里即可；AVSDK 的日志会出现在启动器日志里（`/run/user/1000/linuxqq-wayland-fix.log`）。
+
+**因此下一步不需要再挂探针**：放配置文件 → 重启 QQ → 开共享 → 看日志里有没有
+`uiUseHw[0->1]` 以及 `CVideoEncoder::Init … hardware: 1`。
+
+## 查找名统计（2026-10-03 新增）
+
+日志以前只有计数（`dlvsym 77 次`），没有名字，无法判断那些查找是否与编码器有关。现在每次
+`dlsym`/`dlvsym` 的查找名都会**去重计数**，并由汇总打印 top：
+
+```
+dlsym/dlvsym 查找名 top8（共 4 种）：cos=2 sin=1 pow=1 NvEncodeAPICreateInstance=1
+```
+
+退出汇总印 top-8，周期汇总印 `查找名top3=`；想看逐条明细仍然用 `HWPROBE_ALL=1`。
+

@@ -66,6 +66,72 @@ static int dlvsym_fallback_logged;    /* "真实 dlvsym 取不到，退化成 dl
 static unsigned long n_dlvsym;        /* 走 dlvsym 路径的调用次数 */
 static int path_dlvsym_logged;        /* 目标符号经 dlvsym 被取走，只记一次 */
 
+/* ---------- 查找名统计：回答"那些 dlsym/dlvsym 到底在找什么" ----------
+ *
+ * 2026-10-03 的日志里只有计数（`dlvsym 77 次 / DllGetClassObject 0 次`），没有名字，
+ * 于是判断不了那 77 次是不是编码器相关。全量记录（HWPROBE_ALL=1）能看到名字但会刷屏，
+ * 所以这里做去重计数，由汇总打印 top-N —— 既不刷屏，也不丢信息。 */
+#define LOOKUP_MAXN 64
+#define LOOKUP_NAMELEN 72
+static struct {
+    char name[LOOKUP_NAMELEN];
+    unsigned long count;
+} lookups[LOOKUP_MAXN];
+static int lookups_n;
+static unsigned long lookups_overflow;
+
+static void record_lookup(const char *name)
+{
+    size_t len;
+    int i;
+
+    if (!name || !name[0])
+        return;
+    for (i = 0; i < lookups_n; i++) {
+        if (strcmp(lookups[i].name, name) == 0) {
+            lookups[i].count++;
+            return;
+        }
+    }
+    if (lookups_n >= LOOKUP_MAXN) {
+        lookups_overflow++;
+        return;
+    }
+    len = strlen(name);
+    if (len >= LOOKUP_NAMELEN)
+        len = LOOKUP_NAMELEN - 1;
+    memcpy(lookups[lookups_n].name, name, len);
+    lookups[lookups_n].name[len] = '\0';
+    lookups[lookups_n].count = 1;
+    lookups_n++;
+}
+
+/* 按次数从多到少挑 top 个，写成 "name=count name=count …"（不分配内存） */
+static void lookup_topnames(char *out, size_t cap, int top)
+{
+    int used[LOOKUP_MAXN];
+    int i, k, n = 0;
+
+    if (!cap)
+        return;
+    out[0] = '\0';
+    for (i = 0; i < LOOKUP_MAXN; i++)
+        used[i] = 0;
+    for (k = 0; k < top && k < LOOKUP_MAXN; k++) {
+        int best = -1;
+        for (i = 0; i < lookups_n; i++)
+            if (!used[i] && (best < 0 || lookups[i].count > lookups[best].count))
+                best = i;
+        if (best < 0)
+            break;
+        used[best] = 1;
+        n += snprintf(out + n, cap - (size_t)n, "%s%s=%lu", n ? " " : "",
+                      lookups[best].name, lookups[best].count);
+        if ((size_t)n >= cap)
+            break;
+    }
+}
+
 /* 给 vthook.c 的访问器（日志 fd 与"未被包装"的真实函数） */
 int hwprobe_logfd(void)
 {
@@ -460,6 +526,7 @@ void *dlsym(void *handle, const char *name)
     if (!route_special(handle, name, &r))
         r = real_dlsym ? real_dlsym(handle, name) : NULL;
 
+    record_lookup(name);
     if (interesting_sym(name))
         hwprobe_plog("dlsym(%p, \"%s\") -> %p%s", handle, name ? name : "(null)", r,
              r ? "" : " [没找到]");
@@ -616,6 +683,7 @@ HWPROBE_EXPORT void *dlvsym(void *handle, const char *name, const char *version)
     }
     in_dlvsym = 0;
 
+    record_lookup(name);
     if (interesting_sym(name))
         hwprobe_plog("dlvsym(%p, \"%s\", \"%s\") -> %p%s", handle, name ? name : "(null)",
                      version ? version : "(null)", r, r ? "" : " [没找到]");
@@ -830,6 +898,12 @@ static void summary(void)
          seen_vpx ? "是" : "否", seen_x264 ? "是" : "否", seen_avcodec ? "是" : "否");
     hwprobe_plog("NVENC 初始化调用 %lu 次；驱动能力查询 %lu 次", n_nvenc_api, n_nvenc_ver);
     hwprobe_plog("判读：NVENC 初始化成功(返回 0) => 走了硬编；只有 OpenH264 且 NVENC 初始化 0 次 => 软编");
+    if (lookups_n) {
+        char names[600];
+        lookup_topnames(names, sizeof names, 8);
+        hwprobe_plog("dlsym/dlvsym 查找名 top%d（共 %d 种%s）：%s",
+                     8, lookups_n, lookups_overflow ? "，另有未入表" : "", names);
+    }
     {
         int i;
         hwprobe_plog("--- 本进程 dlopen 过的库（%d 个%s）---", dl_names_n,
@@ -863,7 +937,7 @@ static long mono_now(void)
 
 static void maybe_periodic_summary(void)
 {
-    char b[320];
+    char b[512], top[220];
     int n, i, nlibs;
     long now;
     const char *bc = "否";
@@ -883,12 +957,15 @@ static void maybe_periodic_summary(void)
     nlibs = (seen_nvenc ? 1 : 0) + (seen_cuda ? 1 : 0) + (seen_cuvid ? 1 : 0) +
             (seen_openh264 ? 1 : 0) + (seen_mfx ? 1 : 0) + (seen_amf ? 1 : 0) +
             (seen_vpx ? 1 : 0) + (seen_x264 ? 1 : 0) + (seen_avcodec ? 1 : 0);
+    top[0] = '\0';
+    if (lookups_n)
+        lookup_topnames(top, sizeof top, 3);
     n = snprintf(b, sizeof b,
         "[hwprobe] 周期汇总 pid=%d dlopen=%lu(失败 %lu) dlsym=%lu dlvsym=%lu "
         "DllGetClassObject=%lu nvenc_api=%lu nvenc_ver=%lu broadcast-core=%s "
-        "dlopen库数=%d 编码库=%d\n",
+        "dlopen库数=%d 编码库=%d 查找名top3=%s\n",
         (int)getpid(), n_dlopen, n_dlopen_fail, n_dlsym, n_dlvsym, n_cls,
-        n_nvenc_api, n_nvenc_ver, bc, dl_names_n, nlibs);
+        n_nvenc_api, n_nvenc_ver, bc, dl_names_n, nlibs, top[0] ? top : "-");
     if (n > 0)
         (void)!write(hwprobe_logfd(), b, (size_t)(n < (int)sizeof b ? n : (int)sizeof b - 1));
 }

@@ -111,6 +111,21 @@ for cmd in "/bin/true" "niri msg version" "ldd ./dlvdriver" "python3 -c import c
 done
 
 echo
+echo "=== G. 查找名统计（回答“那些 dlsym/dlvsym 到底在找什么”）"
+gcc -O2 -o lookdriver lookdriver.c -ldl || exit 1
+logG=$(mktemp /tmp/hwprobe-G-XXXX.log)
+outG=$(LD_PRELOAD=../libhwprobe.so HWPROBE_ALL=1 HWPROBE_LOG="$logG" ./lookdriver 2>&1)
+chk $? "宿主正常退出（输出：$(echo "$outG" | head -1)）"
+grep -q "dlsym/dlvsym 查找名 top" "$logG" ; chk $? "汇总里有“查找名 top”行（无需 HWPROBE_ALL 逐条刷屏）"
+grep -q "cos=2" "$logG"                   ; chk $? "重复查找被计数（cos=2）"
+grep -q "sin=1" "$logG"                   ; chk $? "单次查找也入表（sin=1）"
+grep -q "pow=1" "$logG"                   ; chk $? "dlvsym 路径的查找也计入（pow=1）"
+grep -q 'dlsym((nil), "NvEncodeAPICreateInstance")' "$logG" ; chk $? "目标名仍逐条记录（不受查找名表影响）"
+
+echo
+echo "=== 日志样本（G 模式：查找名表）"
+grep -E "查找名" "$logG" | head -3 | sed 's/^/  /'
+echo
 echo "=== 日志样本（E 模式：dlvsym 路径）"
 grep -E "dlvsym|符号介入路径" "$logE" | head -6 | sed 's/^/  /'
 echo
