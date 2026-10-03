@@ -1,0 +1,32 @@
+#!/bin/bash
+# 用探针启动 QQ：把 libhwprobe.so 追加进 LD_PRELOAD，然后交给 linuxqq-wayland-fix。
+#
+# 为什么这样叠加是安全的：linuxqq-wayland-fix 的启动器是
+#   export LD_PRELOAD="$preload${LD_PRELOAD:+:$LD_PRELOAD}"
+# 也就是**前置**它自己的库并保留已有的 LD_PRELOAD —— 所以我们先设，它不会覆盖。
+set -uo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+so="$here/libhwprobe.so"
+
+[ -f "$so" ] || { echo "还没编译，先跑：$here/build.sh" >&2; exit 1; }
+command -v linuxqq-wayland-fix >/dev/null || { echo "找不到 linuxqq-wayland-fix（先装 linuxqq-wayland-fix）" >&2; exit 1; }
+
+logdir="${XDG_CACHE_HOME:-$HOME/.cache}/linuxqq-hwcodec"
+mkdir -p "$logdir"
+log="$logdir/probe-$(date +%Y%m%d-%H%M%S).log"
+
+export HWPROBE_LOG="$log"
+# 画面正常靠它（2026-10-03 实测：--use-angle=vulkan 会让接收画面缩成小图）
+export QQ_WAYLAND_FIX_ANGLE="${QQ_WAYLAND_FIX_ANGLE:-off}"
+# 追加而不是覆盖
+export LD_PRELOAD="$so${LD_PRELOAD:+:$LD_PRELOAD}"
+
+{
+	echo "=== 探针启动 $(date '+%F %T')"
+	echo "    探针库: $so"
+	echo "    QQ_WAYLAND_FIX_ANGLE=$QQ_WAYLAND_FIX_ANGLE"
+	echo "    LD_PRELOAD=$LD_PRELOAD"
+} >>"$log"
+
+printf '日志: %s\n照着用：开一次屏幕共享（30 秒左右），结束后把日志发回来。\n' "$log" >&2
+exec linuxqq-wayland-fix "$@"
