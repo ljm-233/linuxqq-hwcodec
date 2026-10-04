@@ -603,3 +603,55 @@ LD_PRELOAD=$HOME/coding/linuxqq-hwcodec/libqq-nvenc.so QQ_NVENC=1 QQ_NVENC_ACTIV
 ### 本地补丁与新版的关系（只报告，未适配）
 
 `patches/` 下 5 个补丁（`pr28-local-experiments`/`fixkey`/`fixkey-idr-sps`/`asynccb`/`geom-fix`）在 `bc2ec7e` 上**全部 `git apply --check` 失败** ✗（`src/qq-nvenc.c:93` 起冲突）。新版源码已自带 `repeatSPSPPS`（1 处）与 `force_idr`（4 处），但**没有**我们针对 615 驱动写的"不守约就重开会话 / 从码流抠参数集"那套兜底 ✓
+
+
+---
+
+## 本机增强：起播加速与出帧稳定（615 驱动）
+
+**症状**（上游 `bc2ec7e` 版实测）：对端**能看到画面了** ✓，但
+
+- **要等 30~60 秒才出画面**（起播极慢）
+- **出帧不稳定**
+
+**成因**：本机是 **615 驱动**，有两处与作者环境（595）不同的行为：
+
+1. 请求 `NV_ENC_PIC_FLAG_FORCEIDR`（`req_flags` 含 `0x2`）后，驱动返回的 `pictureType` **仍为 0（非 IDR）**，也不输出参数集 → 接收端只能等编码器**自然**产出的下一个 IDR 才能起播（于是 30~60 秒）
+2. `nvEncGetSequenceParams` 在 `nvEncInitializeEncoder` 之后**立刻调用取不到**（驱动要等第一帧）
+
+**本机补丁**（相对 `bc2ec7e`，见 `patches/pr28-fixkey-v2.patch`；默认**关闭**，不设变量 = 上游行为）：
+
+| 开关 | 默认 | 作用 |
+|---|---|---|
+| `QQ_NVENC_FIXKEY` | 0 | 总开关：自管 IDR 周期 + 参数集兜底 |
+| `QQ_NVENC_FIXKEY_INTERVAL` | 60 | 每隔多少帧请求一次 IDR（首帧总是请求） |
+| `QQ_NVENC_FIXKEY_REOPEN` | 1 | 请求了 IDR 但驱动仍不给 → 下一帧**重开会话**（新会话必带 SPS/PPS + 关键帧）|
+
+机制：
+- **自管 IDR**：不依赖驱动的 `idrPeriod`；每次请求后核对返回的 `pictureType`，不是 IDR 就记日志并按上面的开关决定是否重开会话（重开有 30 帧限流，避免每帧重开）
+- **参数集兜底**：编码后再问一次 `nvEncGetSequenceParams`，拿不到就**直接从码流里抠 SPS(7)/PPS(8)** 缓存；拿到后**每帧码流前补一份**（码流已带则不重复），并且**先复制进自己的缓冲**再交给下游（驱动那块解锁即失效）
+- 不动上游新加的 `PKT_OFF_SEQ(0x00)` / `PKT_OFF_TYPE(0x20)` 语义 ✓
+
+**用法**：
+
+```bash
+# 完全退出 QQ（托盘）
+QQ_WAYLAND_FIX_ANGLE=off LD_PRELOAD=$HOME/coding/linuxqq-hwcodec/libqq-nvenc-fixkey.so \
+QQ_NVENC=1 QQ_NVENC_ACTIVE=1 QQ_NVENC_FIXKEY=1 linuxqq-wayland-fix
+# 开共享 → 看对端；日志里应有 [FIXKEY] 行
+grep -a 'FIXKEY' /run/user/1000/linuxqq-wayland-fix.log | head -12
+```
+
+**判读**：成功 = **对端在 1~2 秒内出画面且出帧平稳**（对比不设 `QQ_NVENC_FIXKEY` 时的 30~60 秒）。
+
+日志里的几种情况：
+
+- `[FIXKEY] 已启用：首帧与每 60 帧强制 IDR，驱动不听就重开会话` = 补丁生效
+- `[FIXKEY] 第 N 帧拿到 IDR（下次请求在 M 帧）` = 驱动这次守约了
+- `[FIXKEY] 请求了 IDR 但驱动给了 type=0 —— 下一帧重开会话` = 走兜底（本机 615 上预期会看到）
+- `[FIXKEY] 从驱动取到参数集 …` / `从码流抠到参数集 …` = 参数集到手
+- 出帧日志里带 `（已补 SPS/PPS）` = 该帧被补了参数集
+
+**回退**：去掉 `QQ_NVENC_FIXKEY`（回到上游行为）；或换回 `libqq-nvenc-new.so`（上游版）/ `libqq-nvenc.so`（我们早期的旧基线版）；或整条去掉 `LD_PRELOAD` → 回到「QQ（独显版）」+ `saver` 档 + 刹车。
+
+**离线验证**：`test/fixkey2-ps-test.sh`（从源码按大括号配平抠出真实函数来测，**17 项断言全过**：4/3 字节起始码、纯 P 帧不抠、垃圾输入安全、前缀拼装、大帧容量增长不越界）。

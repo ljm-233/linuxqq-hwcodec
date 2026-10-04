@@ -1,0 +1,295 @@
+diff --git a/src/qq-nvenc.c b/src/qq-nvenc.c
+index 23be3d7..e79bc43 100644
+--- a/src/qq-nvenc.c
++++ b/src/qq-nvenc.c
+@@ -268,6 +268,16 @@ struct wrapped {
+     NV_ENC_INITIALIZE_PARAMS *ip;
+     NV_ENC_CONFIG *cfg;
+ 
++    /* ---- FIXKEY：针对 615 驱动「请求了 FORCEIDR 也不给 IDR、参数集取不到」的兜底 ---- */
++    long fx_next_idr;             /* 下一次该请求 IDR 的帧号 */
++    long fx_last_reopen;          /* 上次重开会话的帧号（限流） */
++    int  fx_reopen_pending;       /* 下一帧重开会话 */
++    int  fx_want_idr;             /* 本帧请求了 IDR（事后核对驱动是否给了） */
++    uint8_t *fx_ps;               /* 缓存的 SPS+PPS（Annex-B，含起始码） */
++    uint32_t fx_ps_len;
++    uint8_t *fx_pkt;              /* 给下游拼前缀用的缓冲（每对象一份） */
++    uint32_t fx_pkt_cap;
++
+     /* SetCodecCallback 拿到的（原始回调，不是我们的转发壳） */
+     int have_cb;
+     void *cb_ctx, *cb0, *cb1;
+@@ -350,6 +360,9 @@ static int nv_open(struct wrapped *w, int wpx, int hpx, int fps, int kbps)
+         kbps = 2000;
+ 
+     nv_close(w);
++    w->fx_next_idr = 0;                 /* 新会话：首帧就要 IDR */
++    w->fx_want_idr = 0;
++    w->fx_reopen_pending = 0;
+ 
+     memset(&sp, 0, sizeof sp);
+     sp.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
+@@ -493,6 +506,135 @@ static void nv_reconfigure(struct wrapped *w, int kbps, int fps)
+ /* 把 VideoFrame(I420) 拷进 NVENC 输入缓冲，编码一帧；码流在【锁定期间】交给 emit 回调，
+  * 由它去填 VideoPacket 并通知 AVSDK。失败返回 -1（调用方回落原实现）。
+  * emit 返回非 0 视为交付失败。 */
++/* ---------- FIXKEY：615 驱动兜底（QQ_NVENC_FIXKEY=1 开启，默认关） ---------- */
++
++static int fx_on;                 /* QQ_NVENC_FIXKEY */
++static int fx_interval = 60;      /* QQ_NVENC_FIXKEY_INTERVAL */
++static int fx_reopen = 1;         /* QQ_NVENC_FIXKEY_REOPEN */
++
++/* 遍历 Annex-B 码流里的 NAL（3/4 字节起始码都可），返回 1 表示取到一个 */
++static int fx_next_nal(const uint8_t *p, uint32_t n, uint32_t *pos,
++                       uint32_t *start, uint32_t *len, int *type)
++{
++    uint32_t i = *pos, k, sc;
++
++    while (i + 3 <= n) {
++        if (p[i] == 0 && p[i + 1] == 0) {
++            if (p[i + 2] == 1) { k = i; sc = 3; break; }
++            if (i + 4 <= n && p[i + 2] == 0 && p[i + 3] == 1) { k = i; sc = 4; break; }
++        }
++        ++i;
++    }
++    if (i + 3 > n)
++        return 0;
++    if (k + sc >= n)
++        return 0;
++    *start = k;
++    *type = p[k + sc] & 0x1f;
++    /* 找下一个起始码作为本 NAL 的结束 */
++    i = k + sc + 1;
++    while (i + 3 <= n) {
++        if (p[i] == 0 && p[i + 1] == 0 &&
++            (p[i + 2] == 1 || (i + 4 <= n && p[i + 2] == 0 && p[i + 3] == 1)))
++            break;
++        ++i;
++    }
++    *len = (i + 3 <= n ? i : n) - k;
++    *pos = (i + 3 <= n ? i : n);
++    return 1;
++}
++
++/* 从码流里抠 SPS(7)+PPS(8)，连起始码一起存进 w->fx_ps */
++static int fx_scan_ps(struct wrapped *w, const uint8_t *p, uint32_t n)
++{
++    uint32_t pos = 0, st = 0, ln = 0, sp = 0, sl = 0, pp = 0, pl = 0;
++    int type = 0;
++
++    while (fx_next_nal(p, n, &pos, &st, &ln, &type)) {
++        if (type == 7 && !sl) { sp = st; sl = ln; }
++        else if (type == 8 && !pl) { pp = st; pl = ln; }
++        if (sl && pl)
++            break;
++    }
++    if (!sl || !pl)
++        return 0;
++    if (w->fx_ps)
++        free(w->fx_ps);
++    w->fx_ps_len = sl + pl;
++    w->fx_ps = malloc(w->fx_ps_len);
++    if (!w->fx_ps) {
++        w->fx_ps_len = 0;
++        return 0;
++    }
++    memcpy(w->fx_ps, p + sp, sl);
++    memcpy(w->fx_ps + sl, p + pp, pl);
++    return 1;
++}
++
++/* 拿参数集：先问驱动（必须在编码之后再问，615 上初始化后立刻问取不到），拿不到就从码流抠 */
++static void fx_grab_ps(struct wrapped *w, const uint8_t *bs, uint32_t bs_len)
++{
++    if (w->fx_ps_len)
++        return;
++    if (nvfl.nvEncGetSequenceParams && w->session) {
++        NV_ENC_SEQUENCE_PARAM_PAYLOAD sp;
++        uint8_t buf[1024];
++        uint32_t outsz = 0;
++        memset(&sp, 0, sizeof sp);
++        sp.version = NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER;
++        sp.inBufferSize = (uint32_t)sizeof buf;
++        sp.spsppsBuffer = buf;
++        sp.outSPSPPSPayloadSize = &outsz;
++        if (nvfl.nvEncGetSequenceParams(w->session, &sp) == NV_ENC_SUCCESS && outsz) {
++            uint32_t k = outsz > sizeof buf ? (uint32_t)sizeof buf : outsz;
++            if (fx_scan_ps(w, buf, k)) {
++                LOG("NVENC: [FIXKEY] 从驱动取到参数集 %u 字节", w->fx_ps_len);
++                return;
++            }
++        }
++    }
++    if (bs && bs_len && fx_scan_ps(w, bs, bs_len))
++        LOG("NVENC: [FIXKEY] 从码流抠到参数集 %u 字节", w->fx_ps_len);
++}
++
++/* 码流第一个 NAL 就是 SPS 时说明已带参数集，不要重复补 */
++static int fx_has_ps(const uint8_t *p, uint32_t n)
++{
++    uint32_t pos = 0, st = 0, ln = 0;
++    int type = 0;
++
++    return fx_next_nal(p, n, &pos, &st, &ln, &type) && type == 7;
++}
++
++/* 把 w->fx_ps 拼在码流前（复制进自己的缓冲：驱动那块解锁即失效） */
++static int fx_prefix(struct wrapped *w, const void *data, uint32_t size,
++                     const void **out, uint32_t *out_size)
++{
++    uint32_t need = w->fx_ps_len + size;
++
++    if (need > w->fx_pkt_cap) {
++        uint8_t *nb = realloc(w->fx_pkt, need);
++        if (!nb)
++            return 0;
++        w->fx_pkt = nb;
++        w->fx_pkt_cap = need;
++    }
++    memcpy(w->fx_pkt, w->fx_ps, w->fx_ps_len);
++    memcpy(w->fx_pkt + w->fx_ps_len, data, size);
++    *out = w->fx_pkt;
++    *out_size = need;
++    return 1;
++}
++
++static void fx_free(struct wrapped *w)
++{
++    free(w->fx_ps);
++    free(w->fx_pkt);
++    w->fx_ps = NULL;
++    w->fx_pkt = NULL;
++    w->fx_ps_len = w->fx_pkt_cap = 0;
++}
++
+ static int nv_encode(struct wrapped *w, VideoFrame *f,
+                      int (*emit)(void *ctx, const void *data, uint32_t size, uint32_t qp, int is_idr),
+                      void *emit_ctx)
+@@ -529,6 +671,13 @@ static int nv_encode(struct wrapped *w, VideoFrame *f,
+                     w->kbps ? w->kbps : 2000))
+             return -1;
+     }
++    if (fx_on && w->fx_reopen_pending) {
++        w->fx_reopen_pending = 0;
++        w->fx_last_reopen = w->frame_idx;
++        LOG("NVENC: [FIXKEY] 驱动未按请求给 IDR —— 重开会话（新会话必带 SPS/PPS + 关键帧）");
++        if (nv_open(w, (int)wpx, (int)hpx, w->fps ? w->fps : 30, w->kbps ? w->kbps : 2000))
++            return -1;
++    }
+     if (w->encode_calls <= 3)
+         LOG("NVENC: 开始编码 %ux%u ypitch=%u uvpitch=%u 平面=%p/%p/%p",
+             wpx, hpx, ypitch, uvpitch, (void *)py, (void *)pu, (void *)pv);
+@@ -566,9 +715,16 @@ static int nv_encode(struct wrapped *w, VideoFrame *f,
+     pp.bufferFmt = NV_ENC_BUFFER_FORMAT_IYUV;
+     pp.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
+     pp.encodePicFlags = NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
++    w->fx_want_idr = 0;
+     if (w->force_idr || w->frame_idx == 0) {
+         pp.encodePicFlags |= NV_ENC_PIC_FLAG_FORCEIDR;
+         w->force_idr = 0;
++        w->fx_want_idr = 1;
++    }
++    if (fx_on && w->frame_idx >= w->fx_next_idr) {
++        /* 自管 IDR 周期：615 上驱动不守 idrPeriod，只能自己按帧号请求 */
++        pp.encodePicFlags |= NV_ENC_PIC_FLAG_FORCEIDR;
++        w->fx_want_idr = 1;
+     }
+     if ((st = nvfl.nvEncEncodePicture(w->session, &pp)) != NV_ENC_SUCCESS) {
+         LOG("NVENC: EncodePicture 失败 status=%d", st);
+@@ -593,6 +749,32 @@ static int nv_encode(struct wrapped *w, VideoFrame *f,
+     } else {
+         r = -1;
+     }
++    if (fx_on) {
++        const uint8_t *bs = (const uint8_t *)lb.bitstreamBufferPtr;
++        uint32_t bsn = lb.bitstreamSizeInBytes;
++
++        fx_grab_ps(w, bs, bsn);
++        if (w->fx_ps_len && w->encode_calls <= 3)
++            LOG("NVENC: [FIXKEY] 参数集 %u 字节已就绪", w->fx_ps_len);
++
++        if (w->fx_want_idr) {
++            if (lb.pictureType == NV_ENC_PIC_TYPE_IDR) {
++                w->fx_next_idr = w->frame_idx + (fx_interval > 0 ? fx_interval : 60);
++                if (w->encode_calls <= 3 || w->frame_idx < 3)
++                    LOG("NVENC: [FIXKEY] 第 %ld 帧拿到 IDR（下次请求在 %ld 帧）",
++                        w->frame_idx, w->fx_next_idr);
++            } else if (fx_reopen && (w->frame_idx - w->fx_last_reopen) >= 30) {
++                w->fx_reopen_pending = 1;
++                w->fx_next_idr = w->frame_idx + 1;
++                LOG("NVENC: [FIXKEY] 请求了 IDR 但驱动给了 type=%d —— 下一帧重开会话",
++                    (int)lb.pictureType);
++            } else {
++                w->fx_next_idr = w->frame_idx + 1;
++                LOG("NVENC: [FIXKEY] 请求了 IDR 但驱动给了 type=%d（本帧照常出流）",
++                    (int)lb.pictureType);
++            }
++        }
++    }
+     nvfl.nvEncUnlockBitstream(w->session, w->outbuf);
+     return r;
+ }
+@@ -643,6 +825,7 @@ static int our_uninit(void *self)
+         return -1;
+     orig = (uninit_fn)w->orig_vtable[VT_OFF_UNINIT];
+     nv_close(w);
++    fx_free(w);
+     return orig(self);
+ }
+ 
+@@ -656,20 +839,32 @@ static int nv_emit_to_avsdk(void *ctx, const void *data, uint32_t size, uint32_t
+ {
+     struct wrapped *w = ctx;
+     void *pk = w->cur_packet;
++    const void *out_data;
++    uint32_t out_size;
++    int prefixed = 0;
+     long long idx;
+ 
+     if (!pk || !w->cb0)
+         return -1;
+     idx = w->frame_idx++;
++    out_data = data;
++    out_size = size;
++    if (fx_on && w->fx_ps_len && !fx_has_ps((const uint8_t *)data, size)) {
++        uint32_t pre = out_size;
++        if (fx_prefix(w, data, size, &out_data, &out_size))
++            prefixed = 1;
++        else
++            out_size = pre;
++    }
+     put32((char *)pk + PKT_OFF_SEQ, (uint32_t)idx);
+     put32((char *)pk + PKT_OFF_IDX, (uint32_t)idx);
+     put32((char *)pk + PKT_OFF_QP, qp);
+-    put32((char *)pk + PKT_OFF_LEN, size);
+-    put64((char *)pk + PKT_OFF_DATA, (void *)(uintptr_t)data);
++    put32((char *)pk + PKT_OFF_LEN, out_size);
++    put64((char *)pk + PKT_OFF_DATA, (void *)(uintptr_t)out_data);
+     put32((char *)pk + PKT_OFF_TYPE, is_idr ? PKT_TYPE_KEY : PKT_TYPE_DELTA);
+-    if (w->encode_calls <= 4)
+-        LOG("NVENC 出帧 idx=%lld %s %u 字节 qp=%u -> 回调", idx,
+-            is_idr ? "IDR" : "P", size, qp);
++    if (w->encode_calls <= 4 || (fx_on && prefixed && idx < 3))
++        LOG("NVENC 出帧 idx=%lld %s %u 字节 qp=%u%s -> 回调", idx,
++            is_idr ? "IDR" : "P", out_size, qp, prefixed ? "（已补 SPS/PPS）" : "");
+     ((pkt_cb_fn)w->cb0)(w->cb_ctx, &pk, w->cb1);
+     if (w->encode_calls <= 4)
+         LOG("NVENC: 回调已返回");
+@@ -1003,6 +1198,17 @@ static void qq_nvenc_init(void)
+     probe_dump = flag_on("QQ_NVENC_PROBE_DUMP", 0);
+     probe_cb = flag_on("QQ_NVENC_PROBE", 0);
+     nv_active = flag_on("QQ_NVENC_ACTIVE", 0);
++    fx_on = flag_on("QQ_NVENC_FIXKEY", 0);
++    {
++        const char *iv = getenv("QQ_NVENC_FIXKEY_INTERVAL");
++        fx_interval = (iv && *iv) ? atoi(iv) : 60;
++        if (fx_interval < 1)
++            fx_interval = 1;
++    }
++    fx_reopen = flag_on("QQ_NVENC_FIXKEY_REOPEN", 1);
++    if (fx_on)
++        LOG("NVENC: [FIXKEY] 已启用：首帧与每 %d 帧强制 IDR%s", fx_interval,
++            fx_reopen ? "，驱动不听就重开会话" : "");
+     if (!is_ppapi_process())
+         return;
+ 
