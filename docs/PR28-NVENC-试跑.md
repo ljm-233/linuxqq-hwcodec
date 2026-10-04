@@ -549,3 +549,57 @@ linuxqq-wayland-fix
 ```
 
 **离线验证**：`geom_fix()` 抠出单测 6 项全过（读反→换回、本来就横→不动、真竖屏→不动、无行距→不动、零尺寸→不动、开关关闭→不动）。
+
+---
+
+## 复测 v2：上游 `bc2ec7e`（2026-10-03 晚）
+
+上游 PR #28 已前进到 **`bc2ec7e`**，提交标题就是 **「补齐 VideoPacket 的帧序号与帧类型（对端看不到画面的根因）」** —— 正好命中我们上一轮判定的头号嫌疑（钩子与下游的交接契约）✓
+
+### 这一版改了什么（对复测有意义的部分）
+
+| 改动 | 意义 |
+|---|---|
+| `VideoPacket` 新增 **`+0x00` 帧序号**（与 IDX 同值）与 **`+0x20` 帧类型**（IDR 填 1、P 填 3） | **我们怀疑缺的就是这两个字段** ✓ |
+| 不再写死偏移：`dlopen(RTLD_NOLOAD)` + `dlsym("CreateH264Encoder")` + 校验那 14 字节 | 对新版 QQ 更稳 |
+| vtable 补 ABI 表头（`[-2]`/`[-1]` 复制、vptr 指向 `blk+2`）、回调按对象隔离、接管析构 | 修第二路编码器拿到第一路回调等问题 |
+| bitrate/fps 变化时 `nvEncReconfigureEncoder` | 档位变动不再需要重开共享 |
+| `QQ_NVENC_PROBE_DUMP` 默认 0；新增 `QQ_NVENC_PROBE`（默认 0） | 默认更安静 |
+
+作者明确说：**这版还没在 QQ 里跑过**（他那边只有 595 驱动 + GNOME）。
+
+### 开关清单（`strings libqq-nvenc-new.so`，共 4 个）
+
+`QQ_NVENC`（总开关，不设=完全不挂钩）· `QQ_NVENC_ACTIVE`（1=真接管）· `QQ_NVENC_PROBE`（旁听壳）· `QQ_NVENC_PROBE_DUMP`
+
+**注意**：我们本地那套开关（`FIXKEY`/`REOPEN_IDR`/`IDR_INTERVAL`/`ASYNCCB`/`BASELINE`/`GEOM_FIX`/`HEXDUMP`）**这一版没有** ✓ 所以复测命令里不要加 ✗
+
+### 复测命令
+
+```bash
+# 完全退出 QQ（托盘）后：
+QQ_WAYLAND_FIX_ANGLE=off \
+LD_PRELOAD=$HOME/coding/linuxqq-hwcodec/libqq-nvenc-new.so \
+QQ_NVENC=1 QQ_NVENC_ACTIVE=1 linuxqq-wayland-fix
+```
+
+产物：`~/coding/linuxqq-hwcodec/libqq-nvenc-new.so`（**120,760 字节**，sha256 `6c13b7c0…`），由 `/tmp/pr28-build-bc2` worktree 构建（0 编译告警）。
+**在用的旧版本未覆盖**：`libqq-nvenc.so`（139,080 字节，含我们的本地补丁）仍在原处 ✓
+
+### 判读顺序
+
+1. **对端是否出现画面** —— 唯一的成功判据 ✓
+2. 若仍无画面：**这一版没有 HEXDUMP**，无法直接看码流 ✗ → 可行的对照办法是改用我们那版（`libqq-nvenc.so` + `QQ_NVENC_HEXDUMP=1 QQ_NVENC_FIXKEY=1`）确认这台机器上"首帧是不是 IDR、有没有参数集"
+3. 若首帧仍不是 IDR / 没有 SPS/PPS → 说明 **615 驱动特有的那两个坑仍在**（`FORCEIDR` 不被遵守、`nvEncGetSequenceParams` 首帧前取不到），需要把我们的 `FIXKEY` 逻辑**移植到 `bc2ec7e` 这个新基线上**（5 个本地补丁在新版上**全部冲突** ✗，只能重写、不能直接 apply）
+
+### 回退
+
+```bash
+# 用回我们那版（含本地补丁）：
+LD_PRELOAD=$HOME/coding/linuxqq-hwcodec/libqq-nvenc.so QQ_NVENC=1 QQ_NVENC_ACTIVE=1 linuxqq-wayland-fix
+# 或直接回到可用状态：去掉整条 LD_PRELOAD / 用「QQ（独显版）」启动
+```
+
+### 本地补丁与新版的关系（只报告，未适配）
+
+`patches/` 下 5 个补丁（`pr28-local-experiments`/`fixkey`/`fixkey-idr-sps`/`asynccb`/`geom-fix`）在 `bc2ec7e` 上**全部 `git apply --check` 失败** ✗（`src/qq-nvenc.c:93` 起冲突）。新版源码已自带 `repeatSPSPPS`（1 处）与 `force_idr`（4 处），但**没有**我们针对 615 驱动写的"不守约就重开会话 / 从码流抠参数集"那套兜底 ✓
