@@ -655,3 +655,33 @@ grep -a 'FIXKEY' /run/user/1000/linuxqq-wayland-fix.log | head -12
 **回退**：去掉 `QQ_NVENC_FIXKEY`（回到上游行为）；或换回 `libqq-nvenc-new.so`（上游版）/ `libqq-nvenc.so`（我们早期的旧基线版）；或整条去掉 `LD_PRELOAD` → 回到「QQ（独显版）」+ `saver` 档 + 刹车。
 
 **离线验证**：`test/fixkey2-ps-test.sh`（从源码按大括号配平抠出真实函数来测，**17 项断言全过**：4/3 字节起始码、纯 P 帧不抠、垃圾输入安全、前缀拼装、大帧容量增长不越界）。
+
+### 复测 v3：`[FIXKEY]` 日志"只有一行"怎么排查
+
+**先说结论**：逐帧 `[FIXKEY]` 行**不需要任何额外开关** ✗ —— 它们就是 `LOG`，只要 `QQ_NVENC_FIXKEY=1` 生效、且代码在那个进程里跑到，就该出现。所以**看不到它们不是"日志被关了"，而是 FIXKEY 在那个进程里根本没跑**：FIXKEY 的**行为**（请求 IDR、每帧补参数集）与这些日志在**同一个 `if (fx_on)` 块**里（请求 IDR 在 `:718-727`，补参数集在 `:852-857`），**没有哪个开关能只关日志不关行为** ✓。
+
+**为什么只看到一行**：`[FIXKEY] 已启用…` 在**每个进程**都会打（构造函数里，紧跟 `QQ_NVENC` 检查）；而**挂钩线程只在 cmdline 含 `--type=ppapi` 的进程里创建**（`:1212` 判定、`:1216` `pthread_create`）。而挂钩/包装那一串日志（`ppapi 进程，等待 AVSDK 加载`、`已挂钩 …`、`包装编码器对象 …`）**都不含 "FIXKEY" 字样** → 用 `grep FIXKEY` 会全部漏掉 ✗。
+
+**正确排查命令**：
+
+```bash
+L=/run/user/1000/linuxqq-wayland-fix.log
+grep -ac 'ppapi 进程，等待 AVSDK 加载' "$L"        # ≥1 才有挂钩线程；0 = 这个实例没进 ppapi
+grep -aE '已挂钩|不挂钩|包装编码器对象|等 AVSDK' "$L" | head -5
+grep -aE '开始编码|出流' "$L" | head -3            # 编码路径确实在跑
+grep -ac '\[FIXKEY\]' "$L"                        # >1 才说明 FIXKEY 生效（首帧至少会打一条）
+```
+
+| ppapi 行 | 已挂钩 | `[FIXKEY]` 行数 | 结论 |
+|---|---|---|---|
+| 有 | 有 | >1 | FIXKEY 生效 ✓ → 只看对端起播时间 |
+| 有 | 有 | 只有 1 | **`QQ_NVENC_FIXKEY` 没进到这个进程的环境** ✗（环境变量只在进程启动时读一次 → 必须**完全退出 QQ** 再起；可用 `nvenc-status.sh` 核对）|
+| 有 | 无 | 1 | 挂钩失败（看 `找不到 … 符号，不挂钩` 或 `头 14 字节与预期不符`）|
+| 无 | — | 1 | 这个实例没进 ppapi 进程（旧实例还在跑 / QQ 没真正重启）✗ |
+
+**本版新增两行状态日志**，把上面的判断变成一眼可见：
+
+```
+ppapi 进程，等待 AVSDK 加载（QQ_NVENC=1, ACTIVE=1, FIXKEY=1）      ← FIXKEY=1 才算武装
+已挂钩 CreateH264Encoder@0x…（蹦床 0x…），NVENC=1 FIXKEY=1
+```
